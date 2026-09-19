@@ -6,8 +6,10 @@ aiohttp
 pydantic
 langchain-core
 langgraph
+langgraph-checkpoint-sqlite
 pillow
 pypdf
 python-docx
 google-genai
 langchain-google-genai
+beautifulsoup4
