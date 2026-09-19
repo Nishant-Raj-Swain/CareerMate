@@ -9,3 +9,4 @@ langgraph>=0.0.10
 pillow>=10.0.0
 pypdf>=3.0.0
 python-docx>=0.8.11
+google-genai
