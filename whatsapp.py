@@ -15,12 +15,13 @@ class WhatsApp:
     def phone_number_id(self) -> str:
         """Dynamically fetch and sanitize phone number ID to avoid empty or invalid base URLs."""
         phone_id = (
-            os.getenv("PHONE_NUMBER_ID", "")
-            or os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
+            os.getenv("WHATSAPP_PHONE_NUMBER_ID", "")
+            or os.getenv("PHONE_NUMBER_ID", "")
         ).strip("/ ")
+        
+        # WARNING: Ensure this ID matches your LIVE Phone Number ID in Meta Developer Console!
         if not phone_id:
-            # Fallback to default active Phone ID
-            phone_id = "1323339190853977"
+            logger.warning("PHONE_NUMBER_ID env variable missing! Ensure it is set in Render.")
         return phone_id
 
     @property
@@ -31,7 +32,10 @@ class WhatsApp:
     @property
     def access_token(self) -> str:
         """Dynamically fetch token to ensure latest environment variables are used."""
-        token = os.getenv("WHATSAPP_ACCESS_TOKEN") or os.getenv("WHATSAPP_TOKEN", "")
+        token = (
+            os.getenv("WHATSAPP_TOKEN", "")
+            or os.getenv("WHATSAPP_ACCESS_TOKEN", "")
+        )
         return token.strip()
 
     @property
@@ -64,41 +68,47 @@ class WhatsApp:
                 clean_body[:3990] + "\n\n*(Message truncated due to length)*"
             )
 
+        # SANITIZE PHONE NUMBER: Remove '+', spaces, and dashes
+        clean_phone = re.sub(r"[^\d]", "", str(phone))
+
         payload = {
             "messaging_product": "whatsapp",
             "recipient_type": "individual",
-            "to": phone,
+            "to": clean_phone,
             "type": "text",
             "text": {"preview_url": False, "body": clean_body},
         }
 
-        logger.info(f"Sending WhatsApp message to {phone}: {payload}")
+        logger.info(f"Sending WhatsApp message to {clean_phone}")
 
         response = await self.client.post(
             f"{self.base_url}/messages", headers=self.headers, json=payload
         )
 
+        # PRINT/LOG THE EXACT OUTGOING META RESPONSE
         if response.status_code != 200:
             logger.error(
                 f"Meta API Error ({response.status_code}): {response.text}"
             )
+        else:
+            logger.info(f"Meta API Success: {response.json()}")
 
         return response
 
     async def menu(self, to: str):
         menu_text = (
             "🤖 *Career Assistant Command Menu*\n\n"
-        "⚡ /news - Get today's top tech news cards\n"
-        "🏆 /competitions - Latest tech competitions\n"
-        "💼 /internships - Latest internships\n"
-        "📝 /prepare <topic> - Start a practice quiz (e.g. /prepare python)\n"
-        "🔍 /job_search - Search for open job roles\n"
-        "🗺️ /roadmap <topic> - Get an official/AI roadmap\n"
-        "📄 /send - Upload/review your resume and know the ats score\n"
-        "💬 /assistance - Ask any career question\n"
-        "🚫 /cancel - Exit current operation or active quiz\n"
-        "🗑️ /delete - Clear local user session\n\n"
-        "Reply with any command to get started!"
+            "⚡ /news - Get today's top tech news cards\n"
+            "🏆 /competitions - Latest tech competitions\n"
+            "💼 /internships - Latest internships\n"
+            "📝 /prepare <topic> - Start a practice quiz (e.g. /prepare python)\n"
+            "🔍 /job_search - Search for open job roles\n"
+            "🗺️ /roadmap <topic> - Get an official/AI roadmap\n"
+            "📄 /send - Upload/review your resume and know the ats score\n"
+            "💬 /assistance - Ask any career question\n"
+            "🚫 /cancel - Exit current operation or active quiz\n"
+            "🗑️ /delete - Clear local user session\n\n"
+            "Reply with any command to get started!"
         )
         await self.text(to, menu_text)
 
@@ -140,9 +150,11 @@ class WhatsApp:
             logger.error("Failed to upload document to WhatsApp Meta API")
             return None
 
+        clean_phone = re.sub(r"[^\d]", "", str(to))
+
         payload = {
             "messaging_product": "whatsapp",
-            "to": to,
+            "to": clean_phone,
             "type": "document",
             "document": {"id": media_id, "filename": filename},
         }
@@ -153,7 +165,6 @@ class WhatsApp:
 
     async def send_roadmap_pdf(self, to: str, topic_name: str) -> bool:
         """Downloads a roadmap PDF from roadmap.sh using clean slug logic and sends it to user."""
-        # 1. Clean topic name into a standard slug
         slug = topic_name.strip().lower()
         slug = re.sub(r"[^a-z0-9\s-]", "", slug)
         slug = re.sub(r"[\s_]+", "-", slug)
@@ -169,7 +180,6 @@ class WhatsApp:
             )
         }
 
-        # 2. Download the PDF asynchronously in memory
         try:
             res = await self.client.get(
                 pdf_url, headers=headers, follow_redirects=True
@@ -194,7 +204,6 @@ class WhatsApp:
             )
             return False
 
-        # 3. Upload and send as a WhatsApp document
         try:
             await self.document(
                 to=to,
@@ -211,9 +220,10 @@ class WhatsApp:
     async def send_image_by_id(
         self, to: str, media_id: str, caption: str = ""
     ):
+        clean_phone = re.sub(r"[^\d]", "", str(to))
         payload = {
             "messaging_product": "whatsapp",
-            "to": to,
+            "to": clean_phone,
             "type": "image",
             "image": {"id": media_id, "caption": caption},
         }
