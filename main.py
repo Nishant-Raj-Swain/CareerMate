@@ -4,6 +4,7 @@ import hmac
 import json
 import logging
 import os
+import sys
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -17,12 +18,19 @@ from langgraph.checkpoint.memory import MemorySaver
 env_path = Path(__file__).resolve().parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
+# Configure explicit logging format to stdout for Render visibility
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("career_bot")
+
 # Environment Variable Resolution
 VERIFY_TOKEN = (os.getenv("WEBHOOK_VERIFY_TOKEN") or "nishi7890").strip()
 WHATSAPP_TOKEN = (os.getenv("WHATSAPP_ACCESS_TOKEN") or os.getenv("WHATSAPP_TOKEN") or "").strip()
-PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID", "").strip()
+PHONE_NUMBER_ID = (os.getenv("WHATSAPP_PHONE_NUMBER_ID") or os.getenv("PHONE_NUMBER_ID") or "").strip()
 APP_SECRET = os.getenv("META_APP_SECRET", "").strip()
-ALLOWED_NUMBERS = {v.strip() for v in os.getenv("ALLOWED_WHATSAPP_NUMBERS", "").split(",") if v.strip()}
 
 import database as db
 import pdf_service
@@ -33,9 +41,6 @@ from whatsapp import WhatsApp
 import quiz_service
 from news_service import NewsService  # Integrated NewsService
 from opportunities_service import opportunities_service
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("career_bot")
 
 wa = None
 ai_service = None
@@ -54,10 +59,15 @@ async def lifespan(app: FastAPI):
     news_service = NewsService(wa_access_token=WHATSAPP_TOKEN, wa_phone_id=PHONE_NUMBER_ID)
 
     if not WHATSAPP_TOKEN:
-        logger.error("❌ WHATSAPP_ACCESS_TOKEN is missing or empty in .env! Outgoing messages will fail.")
+        logger.error("❌ WHATSAPP_TOKEN is missing or empty in environment! Outgoing messages will fail.")
     else:
-        logger.info(f"✅ WHATSAPP_ACCESS_TOKEN loaded successfully! (Length: {len(WHATSAPP_TOKEN)})")
-    
+        logger.info(f"✅ WHATSAPP_TOKEN loaded successfully! (Length: {len(WHATSAPP_TOKEN)})")
+        
+    if not PHONE_NUMBER_ID:
+        logger.error("❌ PHONE_NUMBER_ID is missing or empty in environment! API requests will fail.")
+    else:
+        logger.info(f"✅ PHONE_NUMBER_ID loaded successfully: {PHONE_NUMBER_ID}")
+
     checkpointer = MemorySaver()
     langgraph_app = build_agent(checkpointer)
 
@@ -259,7 +269,6 @@ async def command(phone: str, text: str):
         await wa.menu(phone)
         return
 
-    # --- ADDED: /news feature ---
     if cmd == "/news":
         db.save_state(phone, {})
         await wa.text(phone, "⚡ *Fetching today's top tech news cards...*")
@@ -267,7 +276,6 @@ async def command(phone: str, text: str):
         await wa.menu(phone)
         return
 
-    # --- ADDED: Unstop Opportunities Features ---
     if cmd in ("/competitions", "/competition"):
         db.save_state(phone, {})
         await wa.text(phone, "🔍 *Fetching active competitions from Unstop...*")
@@ -371,7 +379,11 @@ async def process_message(message: dict):
     phone = message.get("from", "")
     msg_id = message.get("id", "")
     
-    if phone not in ALLOWED_NUMBERS or not db.claim_message(msg_id):
+    logger.info(f"Processing incoming message [{msg_id}] from user: {phone}")
+    
+    # Check duplicate processing via DB claim check (Allowlist filter removed for Live production)
+    if not db.claim_message(msg_id):
+        logger.info(f"Message ID [{msg_id}] already processed. Skipping duplicate.")
         return
 
     lock = locks.setdefault(phone, asyncio.Lock())
@@ -455,9 +467,12 @@ async def webhook(request: Request, bg_tasks: BackgroundTasks):
     if APP_SECRET:
         expected = "sha256=" + hmac.new(APP_SECRET.encode(), bytes(buffer), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, expected):
+            logger.warning("Invalid webhook signature from Meta.")
             raise HTTPException(status_code=403)
 
     payload = json.loads(bytes(buffer))
+    
+    # Process valid WhatsApp entry changes
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):
             value = change.get("value", {})
