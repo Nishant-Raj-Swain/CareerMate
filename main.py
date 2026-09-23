@@ -45,6 +45,7 @@ from whatsapp import WhatsApp
 import quiz_service
 from news_service import NewsService  # Integrated NewsService
 from opportunities_service import opportunities_service
+from admin_dashboard import app as admin_app
 
 wa = None
 ai_service = None
@@ -105,6 +106,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="WhatsApp Career Assistant", lifespan=lifespan)
+
+app.mount("/admin", admin_app)
 
 
 async def send_next_question(phone: str, state: dict):
