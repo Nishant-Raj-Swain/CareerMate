@@ -13,3 +13,9 @@ python-docx
 google-genai
 langchain-google-genai
 beautifulsoup4
+
+# Admin Dashboard & Analytics
+streamlit
+pandas
+matplotlib
+seaborn
