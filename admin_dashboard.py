@@ -1,159 +1,73 @@
 import os
-import streamlit as st
-import httpx
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
+import sqlite3
+from fastapi import APIRouter, HTTPException, Header
+from pydantic import BaseModel
 
-st.set_page_config(page_title="Secure WhatsApp Admin", layout="wide")
+router = APIRouter()
 
-# Backend API URL (Points to your FastAPI deployment URL on Render)
-FASTAPI_URL = os.getenv("FASTAPI_BACKEND_URL", "https://your-fastapi-app.onrender.com")
+# --- Request / Response Models ---
+class LoginRequest(BaseModel):
+    username: str
+    password: str
 
-# Initialize Session State Variables
-if "session_token" not in st.session_state:
-    st.session_state["session_token"] = None
-if "auth_credentials" not in st.session_state:
-    st.session_state["auth_credentials"] = None
+# --- Database Helper ---
+def get_analytics_db_connection():
+    db_path = os.getenv("ANALYTICS_DB_PATH", "bot_analytics.db")
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    return conn
 
+# --- Authentication Endpoints ---
+@router.post("/api/auth/login")
+async def login(credentials: LoginRequest):
+    """
+    Authenticates admin user credentials.
+    Replace 'admin' and 'admin123' or integrate with your auth module as needed.
+    """
+    admin_user = os.getenv("ADMIN_USERNAME", "admin")
+    admin_pass = os.getenv("ADMIN_PASSWORD", "admin123")
 
-# -------------------------------------------------------------------
-# Helper Functions to Communicate with FastAPI Backend
-# -------------------------------------------------------------------
-
-def remote_login(username, password):
-    """Authenticates against the FastAPI backend /api/auth/login endpoint."""
-    try:
-        response = httpx.post(
-            f"{FASTAPI_URL}/api/auth/login",
-            json={"username": username, "password": password},
-            timeout=10.0
-        )
-        if response.status_code == 200:
-            return response.json()
-        elif response.status_code == 429:
-            st.error("Too many failed attempts. Account locked for 15 minutes.")
-        else:
-            st.error("Invalid credentials.")
-    except Exception as e:
-        st.error(f"Unable to connect to backend server: {e}")
-    return None
-
-
-def remote_logout(token):
-    """Terminates session on the FastAPI backend."""
-    try:
-        httpx.post(
-            f"{FASTAPI_URL}/api/auth/logout",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=5.0
-        )
-    except Exception:
-        pass
-
-
-def fetch_analytics_logs(token):
-    """Retrieves analytics logs from FastAPI backend using session token."""
-    try:
-        response = httpx.get(
-            f"{FASTAPI_URL}/api/analytics/logs",
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=10.0
-        )
-        if response.status_code == 200:
-            data = response.json()
-            df = pd.DataFrame(data)
-            if not df.empty and 'timestamp' in df.columns:
-                df['timestamp'] = pd.to_datetime(df['timestamp'])
-            return df
-        elif response.status_code == 401:
-            st.warning("Session expired. Please log in again.")
-            st.session_state["session_token"] = None
-            st.rerun()
-    except Exception as e:
-        st.error(f"Failed to fetch analytics from backend API: {e}")
-    return pd.DataFrame()
-
-
-# -------------------------------------------------------------------
-# Authentication Portal
-# -------------------------------------------------------------------
-
-if not st.session_state["session_token"]:
-    st.title("🔒 Admin Authentication Portal")
-    st.subheader("Sign In to Remote Dashboard")
+    if credentials.username == admin_user and credentials.password == admin_pass:
+        return {"token": "valid-admin-session-token-789"}
     
-    with st.form("login_form"):
-        login_user = st.text_input("Username", key="login_user")
-        login_pass = st.text_input("Password", type="password", key="login_pass")
-        submit_button = st.form_submit_button("Log In")
+    raise HTTPException(status_code=401, detail="Invalid username or password")
+
+
+@router.post("/api/auth/logout")
+async def logout(authorization: str = Header(None)):
+    """Handles session termination on backend."""
+    return {"status": "Logged out successfully"}
+
+
+# --- Analytics Logs Endpoint ---
+@router.get("/api/analytics/logs")
+async def get_analytics_logs(authorization: str = Header(None)):
+    """
+    Returns analytics logs recorded in bot_analytics.db for the Streamlit dashboard.
+    """
+    if not authorization or authorization != "Bearer valid-admin-session-token-789":
+        raise HTTPException(status_code=401, detail="Unauthorized session")
+
+    try:
+        conn = get_analytics_db_connection()
+        cursor = conn.cursor()
         
-        if submit_button:
-            if login_user and login_pass:
-                result = remote_login(login_user, login_pass)
-                if result and "token" in result:
-                    st.session_state["session_token"] = result["token"]
-                    st.success("Authenticated successfully!")
-                    st.rerun()
-            else:
-                st.warning("Please enter both username and password.")
-                
-    st.stop()  # Halt execution until authenticated
-
-
-# -------------------------------------------------------------------
-# Protected Analytics Dashboard
-# -------------------------------------------------------------------
-
-st.sidebar.title("🔐 Session Active")
-if st.sidebar.button("Log Out"):
-    remote_logout(st.session_state["session_token"])
-    st.session_state["session_token"] = None
-    st.rerun()
-
-st.title("📊 WhatsApp Bot Analytics Dashboard")
-
-# Fetch Remote Data
-df = fetch_analytics_logs(st.session_state["session_token"])
-
-if df.empty:
-    st.warning("No command logs recorded yet or unable to fetch logs from backend.")
-    st.stop()
-
-# -------------------------------------------------------------------
-# Dashboard Visualizations
-# -------------------------------------------------------------------
-
-col1, col2, col3 = st.columns(3)
-col1.metric("Total Executed Commands", len(df))
-col2.metric("Total Unique Users", df['whatsapp_no'].nunique() if 'whatsapp_no' in df else 0)
-col3.metric("Top Command", df['command'].mode()[0] if 'command' in df and not df.empty else "N/A")
-
-st.markdown("---")
-
-st.subheader("🌐 Overall Command Usage")
-if 'command' in df:
-    overall_counts = df['command'].value_counts().reset_index()
-    overall_counts.columns = ['command', 'count']
-
-    fig1, ax1 = plt.subplots(figsize=(10, 4))
-    sns.barplot(data=overall_counts, x='count', y='command', palette='Blues_r', ax=ax1)
-    st.pyplot(fig1)
-
-st.markdown("---")
-
-st.subheader("👤 User-Specific Command Analysis")
-if 'whatsapp_no' in df:
-    user_list = df['whatsapp_no'].unique().tolist()
-    selected_user = st.selectbox("Select User Phone Number:", user_list)
-    
-    user_df = df[df['whatsapp_no'] == selected_user]
-    user_counts = user_df['command'].value_counts().reset_index()
-    user_counts.columns = ['Command', 'Usage Count']
-
-    fig2, ax2 = plt.subplots(figsize=(8, 4))
-    sns.barplot(data=user_counts, x='Usage Count', y='Command', palette='Viridis', ax=ax2)
-    st.pyplot(fig2)
-
-with st.expander("📄 View Full Raw Logs"):
-    st.dataframe(df.sort_values(by='timestamp', ascending=False), use_container_width=True)
+        # Ensure user_logs table exists
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                whatsapp_no TEXT NOT NULL,
+                command TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        rows = cursor.execute(
+            "SELECT whatsapp_no, command, timestamp FROM user_logs ORDER BY timestamp DESC"
+        ).fetchall()
+        
+        conn.close()
+        
+        return [dict(row) for row in rows]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
