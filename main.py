@@ -4,8 +4,10 @@ import hmac
 import json
 import logging
 import os
+import sqlite3
 import sys
 from contextlib import asynccontextmanager
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -13,6 +15,8 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import Response
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
+
+from auth import init_auth_db  # Import auth initializer
 
 # Load environment variables relative to main.py location
 env_path = Path(__file__).resolve().parent / ".env"
@@ -49,11 +53,35 @@ locks = {}
 langgraph_app = None
 
 
+def log_user_command(whatsapp_no: str, command: str):
+    """Logs user interactions to SQLite for analytics dashboard tracking."""
+    try:
+        conn = sqlite3.connect("bot_analytics.db")
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                whatsapp_no TEXT NOT NULL,
+                command TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            INSERT INTO user_logs (whatsapp_no, command, timestamp)
+            VALUES (?, ?, ?)
+        ''', (whatsapp_no, command.strip(), datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to log command to analytics DB: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global wa, ai_service, news_service, langgraph_app
     
     db.initialize()
+    init_auth_db()  # Initialized auth tables on app startup
     wa = WhatsApp()
     ai_service = AIService()
     news_service = NewsService(wa_access_token=WHATSAPP_TOKEN, wa_phone_id=PHONE_NUMBER_ID)
@@ -381,7 +409,7 @@ async def process_message(message: dict):
     
     logger.info(f"Processing incoming message [{msg_id}] from user: {phone}")
     
-    # Check duplicate processing via DB claim check (Allowlist filter removed for Live production)
+    # Check duplicate processing via DB claim check
     if not db.claim_message(msg_id):
         logger.info(f"Message ID [{msg_id}] already processed. Skipping duplicate.")
         return
@@ -431,6 +459,9 @@ async def process_message(message: dict):
 
         # Text handling with default fallback
         text = (message.get("text", {}) or {}).get("body", "").strip()
+        if text:
+            log_user_command(whatsapp_no=phone, command=text)  # Added: Logging execution details
+
         if text.startswith("/"):
             await command(phone, text)
         elif text:
