@@ -24,8 +24,8 @@ async def login(credentials: LoginRequest):
     Authenticates admin user credentials.
     Replace 'admin' and 'admin123' or integrate with your auth module as needed.
     """
-    admin_user = os.getenv("ADMIN_USERNAME", "admin")
-    admin_pass = os.getenv("ADMIN_PASSWORD", "admin123")
+    admin_user = os.getenv("DEFAULT_ADMIN_USER", "admin")
+    admin_pass = os.getenv("DEFAULT_ADMIN_PASS", "admin123")
 
     if credentials.username == admin_user and credentials.password == admin_pass:
         return {"token": "valid-admin-session-token-789"}
