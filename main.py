@@ -460,7 +460,7 @@ async def process_message(message: dict):
         # Text handling with default fallback
         text = (message.get("text", {}) or {}).get("body", "").strip()
         if text:
-            log_user_command(whatsapp_no=phone, command=text)  # Added: Logging execution details
+            log_user_command(whatsapp_no=phone, command=text)  # Logging execution details
 
         if text.startswith("/"):
             await command(phone, text)
