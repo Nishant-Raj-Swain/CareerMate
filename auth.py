@@ -1,34 +1,56 @@
 import os
 import sqlite3
 import hashlib
+import hmac
 import secrets
 from datetime import datetime, timedelta
 
 # Unified SQLite Database file
 DB_NAME = "bot_analytics.db"
+HASH_ITERATIONS = 600000  # Modern OWASP / NIST standard for PBKDF2-HMAC-SHA256
 
 
-def hash_password(password: str) -> str:
-    """Generates a secure PBKDF2 password hash with a random 32-byte salt."""
-    salt = os.urandom(32)
-    key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, 100000)
+def hash_password(password: str, salt: bytes = None) -> str:
+    """Generates a secure PBKDF2 password hash with 600,000 iterations and a 32-byte salt."""
+    if salt is None:
+        salt = os.urandom(32)
+    key = hashlib.pbkdf2_hmac('sha256', password.encode('utf-8'), salt, HASH_ITERATIONS)
     return salt.hex() + ":" + key.hex()
 
 
 def verify_password(stored_password: str, provided_password: str) -> bool:
-    """Verifies a plain password against the stored salt:hash string."""
+    """Verifies a plain password against the stored salt:hash string in constant time."""
     try:
         salt_hex, key_hex = stored_password.split(":")
         salt = bytes.fromhex(salt_hex)
         stored_key = bytes.fromhex(key_hex)
-        new_key = hashlib.pbkdf2_hmac('sha256', provided_password.encode('utf-8'), salt, 100000)
-        return secrets.compare_digest(stored_key, new_key)
+        
+        new_key = hashlib.pbkdf2_hmac('sha256', provided_password.encode('utf-8'), salt, HASH_ITERATIONS)
+        return hmac.compare_digest(stored_key, new_key)
     except Exception:
         return False
 
 
+def verify_webhook_signature(payload_bytes: bytes, signature_header: str, secret: str) -> bool:
+    """
+    Validates Meta WhatsApp HMAC SHA256 signatures safely using constant-time comparison
+    to eliminate timing attacks.
+    """
+    if not signature_header or not signature_header.startswith("sha256="):
+        return False
+    
+    expected_sig = signature_header.split("sha256=")[1].strip()
+    calculated_sig = hmac.new(
+        secret.encode('utf-8'),
+        payload_bytes,
+        hashlib.sha256
+    ).hexdigest()
+    
+    return hmac.compare_digest(calculated_sig, expected_sig)
+
+
 def seed_default_admin():
-    """Seeds the initial admin account from environment variables if table is empty."""
+    """Seeds the initial admin account from environment variables if the admin table is empty."""
     admin_user = os.getenv("DEFAULT_ADMIN_USER", "admin")
     admin_pass = os.getenv("DEFAULT_ADMIN_PASS", "AdminPass123!")
     
@@ -45,7 +67,7 @@ def seed_default_admin():
 
 
 def init_auth_db():
-    """Initializes authentication, active session, rate limiting tables, and seeds admin."""
+    """Initializes authentication, active session, rate-limiting tables, and seeds default admin."""
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         
@@ -63,14 +85,15 @@ def init_auth_db():
             CREATE TABLE IF NOT EXISTS active_sessions (
                 session_id TEXT PRIMARY KEY,
                 username TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 expires_at DATETIME NOT NULL
             )
         ''')
         
-        # Table 3: Login Attempt Rate Limiting
+        # Table 3: Login Attempt Rate Limiting (Supports both IP and Account tracking)
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS login_attempts (
-                ip_address TEXT PRIMARY KEY,
+                identifier TEXT PRIMARY KEY,
                 attempts INTEGER DEFAULT 0,
                 last_attempt DATETIME
             )
@@ -78,15 +101,14 @@ def init_auth_db():
         
         conn.commit()
 
-    # Automatically trigger admin seeding during DB init
     seed_default_admin()
 
 
-def is_rate_limited(ip_address: str = "127.0.0.1") -> bool:
-    """Checks if an IP address has exceeded failed login limits (5 attempts / 15 mins)."""
+def is_rate_limited(identifier: str, max_attempts: int = 5, window_minutes: int = 15) -> bool:
+    """Checks if an identifier (IP address or Username) has exceeded failed login limits."""
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT attempts, last_attempt FROM login_attempts WHERE ip_address = ?", (ip_address,))
+        cursor.execute("SELECT attempts, last_attempt FROM login_attempts WHERE identifier = ?", (identifier,))
         row = cursor.fetchone()
         
         if row:
@@ -96,34 +118,35 @@ def is_rate_limited(ip_address: str = "127.0.0.1") -> bool:
             except ValueError:
                 return False
 
-            if datetime.now() - last_dt < timedelta(minutes=15) and attempts >= 5:
+            if datetime.utcnow() - last_dt < timedelta(minutes=window_minutes) and attempts >= max_attempts:
                 return True
-            elif datetime.now() - last_dt >= timedelta(minutes=15):
-                cursor.execute("UPDATE login_attempts SET attempts = 0 WHERE ip_address = ?", (ip_address,))
+            elif datetime.utcnow() - last_dt >= timedelta(minutes=window_minutes):
+                cursor.execute("UPDATE login_attempts SET attempts = 0 WHERE identifier = ?", (identifier,))
                 conn.commit()
                 
     return False
 
 
-def record_failed_attempt(ip_address: str = "127.0.0.1"):
-    """Increments failed login counter for a given IP."""
+def record_failed_attempt(identifier: str):
+    """Increments failed login counter for a given identifier (IP or Username)."""
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT INTO login_attempts (ip_address, attempts, last_attempt)
+            INSERT INTO login_attempts (identifier, attempts, last_attempt)
             VALUES (?, 1, ?)
-            ON CONFLICT(ip_address) DO UPDATE SET
+            ON CONFLICT(identifier) DO UPDATE SET
                 attempts = attempts + 1,
                 last_attempt = excluded.last_attempt
-        ''', (ip_address, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        ''', (identifier, now_str))
         conn.commit()
 
 
-def clear_failed_attempts(ip_address: str = "127.0.0.1"):
+def clear_failed_attempts(identifier: str):
     """Clears failed login attempts upon successful authentication."""
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM login_attempts WHERE ip_address = ?", (ip_address,))
+        cursor.execute("DELETE FROM login_attempts WHERE identifier = ?", (identifier,))
         conn.commit()
 
 
@@ -139,10 +162,10 @@ def authenticate_admin(username: str, password: str) -> bool:
     return False
 
 
-def create_session(username: str) -> str:
-    """Generates a secure 24-hour session token and stores it in active_sessions."""
+def create_session(username: str, duration_hours: int = 24) -> str:
+    """Generates a secure 256-bit session token and stores it in active_sessions."""
     session_id = secrets.token_hex(32)
-    expires_at = datetime.now() + timedelta(hours=24)
+    expires_at = datetime.utcnow() + timedelta(hours=duration_hours)
     
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
@@ -155,33 +178,30 @@ def create_session(username: str) -> str:
     return session_id
 
 
-def validate_session(session_id: str) -> bool:
-    """Validates whether a session ID exists and has not expired."""
+def validate_session(session_id: str) -> str:
+    """
+    Validates whether a session ID exists and has not expired.
+    Returns the associated username if valid, or None if invalid/expired.
+    """
     if not session_id:
-        return False
+        return None
         
+    now_str = datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT expires_at FROM active_sessions WHERE session_id = ?", (session_id,))
+        
+        # Purge stale sessions
+        cursor.execute("DELETE FROM active_sessions WHERE expires_at < ?", (now_str,))
+        conn.commit()
+        
+        cursor.execute("SELECT username FROM active_sessions WHERE session_id = ? AND expires_at > ?", (session_id, now_str))
         row = cursor.fetchone()
         
-        if row:
-            try:
-                exp_dt = datetime.strptime(row[0], "%Y-%m-%d %H:%M:%S")
-            except ValueError:
-                return False
-
-            if datetime.now() < exp_dt:
-                return True
-            else:
-                cursor.execute("DELETE FROM active_sessions WHERE session_id = ?", (session_id,))
-                conn.commit()
-                
-    return False
+        return row[0] if row else None
 
 
 def terminate_session(session_id: str):
-    """Deletes an active session (Logout)."""
+    """Deletes an active session token (Logout)."""
     with sqlite3.connect(DB_NAME) as conn:
         cursor = conn.cursor()
         cursor.execute("DELETE FROM active_sessions WHERE session_id = ?", (session_id,))
