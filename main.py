@@ -16,7 +16,7 @@ from fastapi.responses import Response
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
 
-from auth import init_auth_db  # Import auth initializer
+from auth import init_auth_db, verify_webhook_signature  # Import auth initializer
 
 # Load environment variables relative to main.py location
 env_path = Path(__file__).resolve().parent / ".env"
@@ -499,10 +499,9 @@ async def webhook(request: Request, bg_tasks: BackgroundTasks):
     sig = request.headers.get("x-hub-signature-256", "")
     
     if APP_SECRET:
-        expected = "sha256=" + hmac.new(APP_SECRET.encode(), bytes(buffer), hashlib.sha256).hexdigest()
-        if not hmac.compare_digest(sig, expected):
+        if not verify_webhook_signature(bytes(buffer), sig, APP_SECRET):
             logger.warning("Invalid webhook signature from Meta.")
-            raise HTTPException(status_code=403)
+            raise HTTPException(status_code=403, detail="Invalid webhook signature")
 
     payload = json.loads(bytes(buffer))
     
