@@ -4,7 +4,7 @@ from typing import Optional, List, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Header, Request, status
 from pydantic import BaseModel
 
-from backend_updates.auth import (
+from auth import (
     authenticate_admin,
     create_session,
     validate_session,
@@ -13,7 +13,6 @@ from backend_updates.auth import (
     record_failed_attempt,
     clear_failed_attempts,
 )
-
 router = APIRouter()
 
 # --- Request / Response Models ---
