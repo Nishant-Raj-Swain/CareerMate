@@ -13,6 +13,7 @@ from auth import (
     record_failed_attempt,
     clear_failed_attempts,
 )
+
 router = APIRouter()
 
 # --- Request / Response Models ---
@@ -116,19 +117,73 @@ async def verify_token(current_user: str = Depends(require_admin)):
     return {"status": "valid", "username": current_user}
 
 
-# --- Analytics Logs Endpoint ---
+# --- Analytics Endpoints ---
+
+@router.get("/api/analytics/overview")
+async def get_overview(date: Optional[str] = None, current_user: str = Depends(require_admin)):
+    return {
+        "total_users": 0,
+        "users_selected_day": 0,
+        "active_users_7d": 0,
+        "messages_processed": 0,
+        "ai_requests": 0
+    }
+
+@router.get("/api/analytics/new-returning")
+async def get_new_returning(date: Optional[str] = None, current_user: str = Depends(require_admin)):
+    return {"new_users": 0, "returning_users": 0}
+
+@router.get("/api/analytics/growth")
+async def get_growth(months: int = 6, current_user: str = Depends(require_admin)):
+    return {"labels": [], "active_users": []}
+
+@router.get("/api/analytics/daily")
+async def get_daily(start: Optional[str] = None, end: Optional[str] = None, current_user: str = Depends(require_admin)):
+    return {"labels": [], "activity": []}
+
+@router.get("/api/analytics/hourly")
+async def get_hourly(date: Optional[str] = None, current_user: str = Depends(require_admin)):
+    return {"hours": [], "counts": []}
+
+@router.get("/api/analytics/features")
+async def get_features(start: Optional[str] = None, end: Optional[str] = None, current_user: str = Depends(require_admin)):
+    return {"features": {}, "distribution": {}}
+
+@router.get("/api/analytics/funnel")
+async def get_funnel(current_user: str = Depends(require_admin)):
+    return {"steps": [], "conversion_rates": []}
+
+@router.get("/api/analytics/jobs")
+async def get_jobs_analytics(current_user: str = Depends(require_admin)):
+    return {"searches": 0, "top_queries": []}
+
+@router.get("/api/analytics/resume")
+async def get_resume_analytics(current_user: str = Depends(require_admin)):
+    return {"reviews": 0, "avg_score": 0}
+
+@router.get("/api/analytics/quiz")
+async def get_quiz_analytics(current_user: str = Depends(require_admin)):
+    return {"completions": 0, "top_careers": []}
+
+@router.get("/api/analytics/ai")
+async def get_ai_analytics(current_user: str = Depends(require_admin)):
+    return {"requests": 0, "token_count": 0}
+
+@router.get("/api/analytics/performance")
+async def get_performance(current_user: str = Depends(require_admin)):
+    return {"avg_response_time_ms": 0, "uptime": "100%"}
+
+@router.get("/api/analytics/errors")
+async def get_errors(limit: int = 10, current_user: str = Depends(require_admin)):
+    return {"error_count": 0, "recent_errors": []}
 
 @router.get("/api/analytics/logs")
 async def get_analytics_logs(current_user: str = Depends(require_admin)) -> List[Dict[str, Any]]:
-    """
-    Returns recent user logs recorded in bot_analytics.db.
-    Requires a valid admin session.
-    """
+    """Returns recent user logs recorded in bot_analytics.db."""
     try:
         conn = get_analytics_db_connection()
         cursor = conn.cursor()
 
-        # Ensure legacy user_logs table exists
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS user_logs (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
