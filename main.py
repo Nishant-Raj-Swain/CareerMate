@@ -55,24 +55,9 @@ langgraph_app = None
 
 
 def log_user_command(whatsapp_no: str, command: str):
-    """Logs user interactions to SQLite for analytics dashboard tracking."""
+    """Logs user interactions to persistent DB for analytics dashboard tracking."""
     try:
-        conn = sqlite3.connect("bot_analytics.db")
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS user_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                whatsapp_no TEXT NOT NULL,
-                command TEXT NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        cursor.execute('''
-            INSERT INTO user_logs (whatsapp_no, command, timestamp)
-            VALUES (?, ?, ?)
-        ''', (whatsapp_no, command.strip(), datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
-        conn.commit()
-        conn.close()
+        db.log_command(whatsapp_no=whatsapp_no, command=command.strip())
     except Exception as e:
         logger.error(f"Failed to log command to analytics DB: {e}")
 
@@ -81,8 +66,9 @@ def log_user_command(whatsapp_no: str, command: str):
 async def lifespan(app: FastAPI):
     global wa, ai_service, news_service, langgraph_app
     
-    db.initialize()
-    init_auth_db()  # Initialized auth tables on app startup
+    db.initialize()  # Creates PostgreSQL tables in Supabase automatically
+    init_auth_db()   # Initializes auth tables
+    
     wa = WhatsApp()
     ai_service = AIService()
     news_service = NewsService(wa_access_token=WHATSAPP_TOKEN, wa_phone_id=PHONE_NUMBER_ID)
