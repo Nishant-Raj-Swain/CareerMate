@@ -57,9 +57,20 @@ langgraph_app = None
 def log_user_command(whatsapp_no: str, command: str):
     """Logs user interactions to persistent DB for analytics dashboard tracking."""
     try:
-        db.log_command(whatsapp_no=whatsapp_no, command=command.strip())
+        # Determine if it's a command or regular message
+        event_type = "command" if command.startswith("/") else "message"
+        cmd_name = command.split()[0] if command.startswith("/") else None
+        
+        db.log_analytics_event(
+            user_phone=whatsapp_no,
+            event_type=event_type,
+            command=cmd_name,
+            success=True,
+            response_time=0.0
+        )
     except Exception as e:
         logger.error(f"Failed to log command to analytics DB: {e}")
+
 
 
 @asynccontextmanager
