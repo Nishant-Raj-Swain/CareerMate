@@ -145,11 +145,11 @@ def log_analytics_event(user_phone: str, event_type: str, command: str = None, s
         conn.commit()
 
 
-def log_quiz_result(user_phone: str, topic: str, score: int, completed: bool):
+def log_quiz_result(user_phone: str, topic: str, score: int, attempted: int, completed: bool):
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO quiz_analytics (user_phone, topic, score, completed, timestamp)
-                VALUES (%s, %s, %s, %s, NOW())
-            """, (user_phone, topic, score, completed))
+                INSERT INTO quiz_analytics (user_phone, topic, score, attempted, completed, timestamp)
+                VALUES (%s, %s, %s, %s, %s, NOW())
+            """, (user_phone, topic, score, attempted, completed))
         conn.commit()
