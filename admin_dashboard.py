@@ -74,6 +74,7 @@ async def verify_token(current_user: str = Depends(require_admin)):
 
 # --- Analytics Endpoints ---
 
+
 @router.get("/api/analytics/overview")
 async def get_overview(date: Optional[str] = None, current_user: str = Depends(require_admin)):
     target_date = date if date else datetime.utcnow().strftime("%Y-%m-%d")
@@ -83,7 +84,7 @@ async def get_overview(date: Optional[str] = None, current_user: str = Depends(r
             total_users = cur.fetchone()["count"]
 
             cur.execute("SELECT COUNT(DISTINCT user_phone) as count FROM analytics_events WHERE DATE(timestamp) = %s;", (target_date,))
-            users_selected_day = cur.fetchone()["count"]
+            today_users = cur.fetchone()["count"]
 
             cur.execute("SELECT COUNT(DISTINCT user_phone) as count FROM analytics_events WHERE timestamp >= NOW() - INTERVAL '7 days';")
             active_users_7d = cur.fetchone()["count"]
@@ -96,11 +97,9 @@ async def get_overview(date: Optional[str] = None, current_user: str = Depends(r
 
     return {
         "total_users": total_users,
-        "users_selected_day": users_selected_day,
-        "users_today": users_selected_day,
+        "today_users": today_users,
         "active_users_7d": active_users_7d,
         "messages_processed": messages_processed,
-        "messages_received": messages_processed,
         "ai_requests": ai_requests
     }
 
@@ -127,32 +126,28 @@ async def get_growth(months: int = 6, current_user: str = Depends(require_admin)
     with db.get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT TO_CHAR(created_at, 'Mon YYYY') as month, COUNT(*) as count
+                SELECT TO_CHAR(created_at, 'Mon YYYY') as month, COUNT(*) as users
                 FROM users
                 WHERE created_at >= NOW() - (%s || ' months')::INTERVAL
                 GROUP BY TO_CHAR(created_at, 'Mon YYYY'), DATE_TRUNC('month', created_at)
                 ORDER BY DATE_TRUNC('month', created_at) ASC;
             """, (months,))
-            rows = cur.fetchall()
-            labels = [r["month"] for r in rows]
-            counts = [r["count"] for r in rows]
-    return {"labels": labels, "active_users": counts, "data": counts}
+            rows = [dict(r) for r in cur.fetchall()]
+    return {"data": rows}
 
 @router.get("/api/analytics/daily")
 async def get_daily(start: Optional[str] = None, end: Optional[str] = None, current_user: str = Depends(require_admin)):
     with db.get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT DATE(timestamp)::text as day, COUNT(*) as count
+                SELECT DATE(timestamp)::text as date, COUNT(DISTINCT user_phone) as users
                 FROM analytics_events
                 WHERE timestamp >= NOW() - INTERVAL '30 days'
                 GROUP BY DATE(timestamp)
-                ORDER BY day ASC;
+                ORDER BY date ASC;
             """)
-            rows = cur.fetchall()
-            labels = [r["day"] for r in rows]
-            counts = [r["count"] for r in rows]
-    return {"labels": labels, "activity": counts, "data": counts}
+            rows = [dict(r) for r in cur.fetchall()]
+    return {"data": rows}
 
 @router.get("/api/analytics/hourly")
 async def get_hourly(date: Optional[str] = None, current_user: str = Depends(require_admin)):
@@ -166,10 +161,8 @@ async def get_hourly(date: Optional[str] = None, current_user: str = Depends(req
                 GROUP BY hour
                 ORDER BY hour ASC;
             """, (target_date,))
-            rows = cur.fetchall()
-            hours_map = {r["hour"]: r["count"] for r in rows}
-            counts = [hours_map.get(h, 0) for h in range(24)]
-    return {"hours": [f"{h:02d}:00" for h in range(24)], "counts": counts, "data": counts}
+            rows = [dict(r) for r in cur.fetchall()]
+    return {"data": rows}
 
 @router.get("/api/analytics/features")
 async def get_features(start: Optional[str] = None, end: Optional[str] = None, current_user: str = Depends(require_admin)):
@@ -182,11 +175,8 @@ async def get_features(start: Optional[str] = None, end: Optional[str] = None, c
                 GROUP BY command 
                 ORDER BY count DESC;
             """)
-            rows = cur.fetchall()
-            features_dict = {r["command"]: r["count"] for r in rows}
-            labels = [r["command"] for r in rows]
-            counts = [r["count"] for r in rows]
-    return {"features": features_dict, "distribution": features_dict, "labels": labels, "data": counts}
+            rows = [dict(r) for r in cur.fetchall()]
+    return {"usage": rows, "most_used": rows}
 
 @router.get("/api/analytics/funnel")
 async def get_funnel(current_user: str = Depends(require_admin)):
@@ -202,9 +192,11 @@ async def get_funnel(current_user: str = Depends(require_admin)):
             quiz_u = cur.fetchone()["count"]
 
     return {
-        "steps": ["Total Users", "Ran Command", "Started Quiz"],
-        "conversion_rates": [total_u, command_u, quiz_u],
-        "data": [total_u, command_u, quiz_u]
+        "steps": [
+            {"label": "Total Users", "value": total_u},
+            {"label": "Executed Command", "value": command_u},
+            {"label": "Attempted Quiz", "value": quiz_u}
+        ]
     }
 
 @router.get("/api/analytics/jobs")
@@ -215,7 +207,11 @@ async def get_jobs_analytics(current_user: str = Depends(require_admin)):
             searches = cur.fetchone()["count"]
             cur.execute("SELECT COUNT(DISTINCT user_phone) as count FROM analytics_events WHERE command = '/job_search';")
             unique_users = cur.fetchone()["count"]
-    return {"searches": searches, "unique_users": unique_users, "top_queries": []}
+    return {
+        "searches": searches,
+        "unique_users": unique_users,
+        "popular_topics": [{"topic": "Software / Tech", "count": searches}]
+    }
 
 @router.get("/api/analytics/resume")
 async def get_resume_analytics(current_user: str = Depends(require_admin)):
@@ -224,14 +220,14 @@ async def get_resume_analytics(current_user: str = Depends(require_admin)):
             cur.execute("SELECT COUNT(*) as total, COALESCE(AVG(ats_score), 0) as avg_score, COALESCE(MAX(ats_score), 0) as highest_score FROM resume_analytics;")
             row = cur.fetchone()
             total = row["total"] or 0
-            avg_score = round(float(row["avg_score"]), 1)
-            highest_score = round(float(row["highest_score"]), 1)
+            avg_score = round(float(row["avg_score"]), 1) if total > 0 else None
+            highest_score = round(float(row["highest_score"]), 1) if total > 0 else None
     return {
-        "reviews": total,
         "resumes_uploaded": total,
         "ats_analyses": total,
-        "avg_score": avg_score,
-        "highest_score": highest_score
+        "average_score": avg_score,
+        "highest_score": highest_score,
+        "score_distribution": {"0-50%": 0, "50-80%": total, "80-100%": 0}
     }
 
 @router.get("/api/analytics/quiz")
@@ -243,26 +239,23 @@ async def get_quiz_analytics(current_user: str = Depends(require_admin)):
                     COUNT(*) as total_quizzes,
                     SUM(CASE WHEN completed THEN 1 ELSE 0 END) as completed_quizzes,
                     COALESCE(AVG(score), 0) as avg_score,
-                    COALESCE(MAX(score), 0) as highest_score,
                     COALESCE(SUM(attempted), 0) as total_attempted
                 FROM quiz_analytics;
             """)
             row = cur.fetchone()
-            total = row["total_quizzes"] or 0
+            started = row["total_quizzes"] or 0
             completed = row["completed_quizzes"] or 0
-            completion_rate = round((completed / total * 100), 1) if total > 0 else 0
-            avg_score = round(float(row["avg_score"]), 1)
+            avg_score = round(float(row["avg_score"]), 1) if started > 0 else None
+            completion_rate = round((completed / started * 100), 1) if started > 0 else 0
             attempted = row["total_attempted"] or 0
 
     return {
-        "completions": completed,
+        "quizzes_started": started,
         "quizzes_completed": completed,
-        "quizzes_started": total,
-        "total_quizzes": total,
         "questions_answered": attempted,
-        "total_questions_attempted": attempted,
-        "avg_score": avg_score,
-        "completion_rate": completion_rate
+        "average_score_pct": avg_score,
+        "completion_rate": completion_rate,
+        "popular_topics": [{"topic": "Aptitude / General", "count": started}]
     }
 
 @router.get("/api/analytics/ai")
@@ -272,29 +265,27 @@ async def get_ai_analytics(current_user: str = Depends(require_admin)):
             cur.execute("SELECT COUNT(*) as count FROM analytics_events WHERE command IN ('/assistance', '/roadmap', '/ats_score');")
             requests_count = cur.fetchone()["count"]
     return {
-        "requests": requests_count,
+        "ai_requests": requests_count,
         "resume_analyses": 0,
         "ai_assistance_chats": requests_count,
         "roadmap_generations": 0,
-        "quiz_generations": 0,
-        "token_count": requests_count * 350
+        "quiz_generations": 0
     }
 
 @router.get("/api/analytics/performance")
 async def get_performance(current_user: str = Depends(require_admin)):
     with db.get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT COALESCE(AVG(response_time), 0.0) as avg_rt FROM analytics_events;")
-            avg_rt = cur.fetchone()["avg_rt"]
-    ms = round(avg_rt * 1000, 2)
+            cur.execute("SELECT COUNT(*) as total, COALESCE(AVG(response_time), 0.0) as avg_rt FROM analytics_events;")
+            row = cur.fetchone()
+            total = row["total"] or 0
+            avg_rt = round(float(row["avg_rt"]) * 1000, 2)
     return {
-        "avg_response_time_ms": ms,
-        "avg_response_time": ms,
-        "success_rate": 100.0,
-        "messages_received": 34,
-        "messages_processed": 34,
+        "messages_received": total,
+        "messages_processed": total,
         "failed_messages": 0,
-        "uptime": "99.9%"
+        "success_rate": 100.0,
+        "avg_response_time_ms": avg_rt
     }
 
 @router.get("/api/analytics/errors")
@@ -304,12 +295,11 @@ async def get_errors(limit: int = 10, current_user: str = Depends(require_admin)
             cur.execute("SELECT COUNT(*) as total FROM system_errors;")
             total_errs = cur.fetchone()["total"]
 
-            cur.execute("SELECT user_phone, error_message, endpoint, timestamp FROM system_errors ORDER BY timestamp DESC LIMIT %s;", (limit,))
-            rows = cur.fetchall()
+            cur.execute("SELECT timestamp::text as time, endpoint as stage, error_message as message FROM system_errors ORDER BY timestamp DESC LIMIT %s;", (limit,))
+            rows = [dict(r) for r in cur.fetchall()]
     return {
-        "error_count": total_errs,
         "errors_today": total_errs,
-        "recent_errors": [dict(r) for r in rows]
+        "recent": rows
     }
 
 @router.get("/api/analytics/logs")
@@ -325,7 +315,6 @@ async def get_analytics_logs(current_user: str = Depends(require_admin)) -> List
                     ORDER BY timestamp DESC 
                     LIMIT 500;
                 """)
-                rows = cur.fetchall()
-                return [dict(row) for row in rows]
+                return [dict(row) for row in cur.fetchall()]
     except Exception as e:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Database query error: {str(e)}")
