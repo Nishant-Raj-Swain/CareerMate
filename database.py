@@ -134,14 +134,22 @@ def delete_user(phone: str):
         with conn.cursor() as cur:
             cur.execute("DELETE FROM users WHERE phone = %s", (phone,))
         conn.commit()
+        
 
-def log_analytics_event(user_phone: str, event_type: str, command: str = None, success: bool = True, response_time: float = 0.0):
+def log_analytics_event(
+    user_phone: str, 
+    event_type: str, 
+    command: str = None, 
+    success: bool = True, 
+    response_time: float = 0.0,
+    event_details: str = None
+):
     with get_connection() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                INSERT INTO analytics_events (user_phone, event_type, command, success, response_time, timestamp)
-                VALUES (%s, %s, %s, %s, %s, NOW())
-            """, (user_phone, event_type, command, success, response_time))
+                INSERT INTO analytics_events (user_phone, event_type, command, success, response_time, event_details, timestamp)
+                VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            """, (user_phone, event_type, command, success, response_time, event_details))
         conn.commit()
 
 
