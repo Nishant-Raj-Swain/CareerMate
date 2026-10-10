@@ -117,6 +117,12 @@ async def send_next_question(phone: str, state: dict):
         total = len(questions)
         topic = state.get("topic", "Quiz").title()
         
+        # Log completed quiz to database
+        try:
+            db.log_quiz_result(user_phone=phone, topic=topic, score=score, completed=True)
+        except Exception as e:
+            logger.error(f"Failed to log completed quiz analytics: {e}")
+        
         await wa.text(
             phone, 
             f"🎉 *{topic} Quiz Completed!*\n\n"
@@ -142,7 +148,7 @@ async def send_next_question(phone: str, state: dict):
         f"_Reply with A, B, C, or D (or send *exit* to quit early)_"
     )
     await wa.text(phone, msg)
-
+    
 
 async def handle_roadmap_generation(phone: str, topic: str):
     """Generates an official PDF roadmap or falls back to an AI visual roadmap card."""
@@ -183,6 +189,12 @@ async def handle_text(phone: str, text: str):
             attempted = state.get("current_index", 0)
             topic = state.get("topic", "Quiz").title()
             
+            # Log early exit to quiz_analytics
+            try:
+                db.log_quiz_result(user_phone=phone, topic=topic, score=score, completed=False)
+            except Exception as e:
+                logger.error(f"Failed to log early quiz exit analytics: {e}")
+
             await wa.text(
                 phone,
                 f"🛑 *Test Ended Early*\n\n"
@@ -228,6 +240,16 @@ async def handle_text(phone: str, text: str):
         await wa.text(phone, f"🎯 Evaluating resume for target role: *{target_role}*...")
         
         score_report = await ai_service.score_resume_ats(resume_text=text, target_role=target_role)
+        
+        # Extract numeric ATS score and save to resume_analytics
+        try:
+            import re
+            match = re.search(r'(\d{1,3})\s*%', score_report)
+            ats_val = int(match.group(1)) if match else None
+            db.log_resume_analytics(user_phone=phone, ats_score=ats_val, analysis_type="ats_score")
+        except Exception as e:
+            logger.error(f"Failed to log ATS resume analytics: {e}")
+
         db.save_state(phone, {})
         await wa.text(phone, score_report)
         await wa.menu(phone)
@@ -237,6 +259,12 @@ async def handle_text(phone: str, text: str):
         db.save_resume(phone, text)
         await wa.text(phone, "Resume saved. Generating review...")
         review = await ai_service.analyze_resume(text)
+        
+        try:
+            db.log_resume_analytics(user_phone=phone, ats_score=None, analysis_type="review")
+        except Exception as e:
+            logger.error(f"Failed to log resume review analytics: {e}")
+
         db.save_state(phone, {})
         await wa.text(phone, review)
         await wa.menu(phone)
@@ -280,6 +308,7 @@ async def handle_text(phone: str, text: str):
 
     await wa.text(phone, "Please select a command from the menu.")
     await wa.menu(phone)
+
 
 
 async def command(phone: str, text: str):
