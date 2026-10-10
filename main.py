@@ -117,9 +117,15 @@ async def send_next_question(phone: str, state: dict):
         total = len(questions)
         topic = state.get("topic", "Quiz").title()
         
-        # Log completed quiz to database
+        # Log completed quiz to database with attempted count
         try:
-            db.log_quiz_result(user_phone=phone, topic=topic, score=score, completed=True)
+            db.log_quiz_result(
+                user_phone=phone, 
+                topic=topic, 
+                score=score, 
+                attempted=total, 
+                completed=True
+            )
         except Exception as e:
             logger.error(f"Failed to log completed quiz analytics: {e}")
         
@@ -173,6 +179,7 @@ async def handle_roadmap_generation(phone: str, topic: str):
         await wa.text(phone, roadmap_data.get("summary", ""))
         
     await wa.menu(phone)
+    
 
 
 async def handle_text(phone: str, text: str):
@@ -191,10 +198,11 @@ async def handle_text(phone: str, text: str):
             
             # Log early exit to quiz_analytics
             try:
-                db.log_quiz_result(user_phone=phone, topic=topic, score=score, completed=False)
+                db.log_quiz_result(user_phone=phone, topic=topic, score=score, attempted=attempted, completed=False)
             except Exception as e:
                 logger.error(f"Failed to log early quiz exit analytics: {e}")
 
+        
             await wa.text(
                 phone,
                 f"🛑 *Test Ended Early*\n\n"
