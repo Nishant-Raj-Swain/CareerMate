@@ -143,3 +143,13 @@ def log_analytics_event(user_phone: str, event_type: str, command: str = None, s
                 VALUES (%s, %s, %s, %s, %s, NOW())
             """, (user_phone, event_type, command, success, response_time))
         conn.commit()
+
+
+def log_quiz_result(user_phone: str, topic: str, score: int, completed: bool):
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO quiz_analytics (user_phone, topic, score, completed, timestamp)
+                VALUES (%s, %s, %s, %s, NOW())
+            """, (user_phone, topic, score, completed))
+        conn.commit()
