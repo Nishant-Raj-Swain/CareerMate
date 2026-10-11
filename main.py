@@ -415,28 +415,26 @@ async def command(phone: str, text: str):
         await send_next_question(phone, quiz_state)
         return
 
-     if cmd == "/job_search":
-            if len(parts) > 1:
-                domain_query = parts[1].strip()
-                db.save_state(phone, {})
-        
-                # Log with event_details
-                db.log_analytics_event(
-                    user_phone=phone,
-                    event_type="command",
-                    command="/job_search",
-                    event_details=domain_query
-                )
-        
-                await wa.text(phone, f"🔍 Searching for recent *{domain_query}* job postings...")
-                job_results = await ai_service.search_jobs(domain_query)
-                await wa.text(phone, job_results)
-                await wa.menu(phone)
-            else:
-                db.save_state(phone, {"mode": "job_search"})
-                await wa.text(phone, "🔍 *Job Search Mode*\n\nPlease reply with the role or domain you are searching for (e.g., Data Analyst, Python Developer).")
-            return
-
+    if cmd == "/job_search":
+        if len(parts) > 1:
+            domain_query = parts[1].strip()
+            db.save_state(phone, {})
+            
+            db.log_analytics_event(
+                user_phone=phone,
+                event_type="command",
+                command="/job_search",
+                event_details=domain_query
+            )
+            
+            await wa.text(phone, f"🔍 Searching for recent *{domain_query}* job postings...")
+            job_results = await ai_service.search_jobs(domain_query)
+            await wa.text(phone, job_results)
+            await wa.menu(phone)
+        else:
+            db.save_state(phone, {"mode": "job_search"})
+            await wa.text(phone, "🔍 *Job Search Mode*\n\nPlease reply with the role or domain you are searching for (e.g., Data Analyst, Python Developer).")
+        return
 
 
     if cmd == "/roadmap":
