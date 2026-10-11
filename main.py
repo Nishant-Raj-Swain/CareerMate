@@ -280,18 +280,18 @@ async def handle_text(phone: str, text: str):
 
     if mode == "job_search":
         search_query = text.strip()
-    
-        # Log with event_details
+        
+        # Log the search topic directly to analytics_events
         db.log_analytics_event(
             user_phone=phone,
             event_type="command",
             command="/job_search",
             event_details=search_query
         )
-    
+        
         await wa.text(phone, f"🔍 Searching for recent *{search_query}* job postings...")
         job_results = await ai_service.search_jobs(search_query)
-    
+        
         db.save_state(phone, {})
         await wa.text(phone, job_results)
         await wa.menu(phone)
