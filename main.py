@@ -54,10 +54,9 @@ locks = {}
 langgraph_app = None
 
 
-def log_user_command(whatsapp_no: str, command: str):
+def log_user_command(whatsapp_no: str, command: str, event_details: str = None):
     """Logs user interactions to persistent DB for analytics dashboard tracking."""
     try:
-        # Determine if it's a command or regular message
         event_type = "command" if command.startswith("/") else "message"
         cmd_name = command.split()[0] if command.startswith("/") else None
         
@@ -66,11 +65,11 @@ def log_user_command(whatsapp_no: str, command: str):
             event_type=event_type,
             command=cmd_name,
             success=True,
-            response_time=0.0
+            response_time=0.0,
+            event_details=event_details
         )
     except Exception as e:
         logger.error(f"Failed to log command to analytics DB: {e}")
-
 
 
 @asynccontextmanager
@@ -416,10 +415,19 @@ async def command(phone: str, text: str):
         await send_next_question(phone, quiz_state)
         return
 
-    if cmd == "/job_search":
+     if cmd == "/job_search":
         if len(parts) > 1:
             domain_query = parts[1].strip()
             db.save_state(phone, {})
+    
+            # Log with event_details
+            db.log_analytics_event(
+                user_phone=phone,
+                event_type="command",
+                command="/job_search",
+                event_details=domain_query
+            )
+    
             await wa.text(phone, f"🔍 Searching for recent *{domain_query}* job postings...")
             job_results = await ai_service.search_jobs(domain_query)
             await wa.text(phone, job_results)
@@ -428,6 +436,8 @@ async def command(phone: str, text: str):
             db.save_state(phone, {"mode": "job_search"})
             await wa.text(phone, "🔍 *Job Search Mode*\n\nPlease reply with the role or domain you are searching for (e.g., Data Analyst, Python Developer).")
         return
+
+
 
     if cmd == "/roadmap":
         if len(parts) > 1:
