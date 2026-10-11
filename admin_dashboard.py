@@ -199,19 +199,47 @@ async def get_funnel(current_user: str = Depends(require_admin)):
         ]
     }
 
+
+
 @router.get("/api/analytics/jobs")
 async def get_jobs_analytics(current_user: str = Depends(require_admin)):
     with db.get_connection() as conn:
         with conn.cursor() as cur:
+            # Count total job search executions
             cur.execute("SELECT COUNT(*) as count FROM analytics_events WHERE command = '/job_search';")
             searches = cur.fetchone()["count"]
+
+            # Count unique users who searched
             cur.execute("SELECT COUNT(DISTINCT user_phone) as count FROM analytics_events WHERE command = '/job_search';")
             unique_users = cur.fetchone()["count"]
+
+            # Query most frequent domains/topics recorded in event_details
+            cur.execute("""
+                SELECT 
+                    INITCAP(TRIM(event_details)) as topic,
+                    COUNT(*) as count
+                FROM analytics_events
+                WHERE command = '/job_search' 
+                  AND event_details IS NOT NULL 
+                  AND TRIM(event_details) != ''
+                GROUP BY INITCAP(TRIM(event_details))
+                ORDER BY count DESC
+                LIMIT 5;
+            """)
+            rows = cur.fetchall()
+
+            # Map results to popular_topics expected by dashboard.js
+            popular_topics = [
+                {"topic": r["topic"], "count": r["count"]} for r in rows
+            ]
+
     return {
         "searches": searches,
         "unique_users": unique_users,
-        "popular_topics": [{"topic": "Software / Tech", "count": searches}]
+        "popular_topics": popular_topics
     }
+
+
 
 @router.get("/api/analytics/resume")
 async def get_resume_analytics(current_user: str = Depends(require_admin)):
