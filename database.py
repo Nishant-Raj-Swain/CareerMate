@@ -135,7 +135,6 @@ def delete_user(phone: str):
             cur.execute("DELETE FROM users WHERE phone = %s", (phone,))
         conn.commit()
         
-
 def log_analytics_event(
     user_phone: str, 
     event_type: str, 
