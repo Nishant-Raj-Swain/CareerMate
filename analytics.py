@@ -1,23 +1,34 @@
-# analytics.py
-# Everything the admin dashboard needs: one rich event table
-# (analytics_events) plus a function per dashboard section that
-# aggregates it into the shape the Flask panel expects.
+# analytics.py  (PostgreSQL / Supabase edition)
+# Everything the admin dashboard needs, computed from your Supabase Postgres
+# database (DATABASE_URL), the same database database.py uses.
 #
-# Uses the shared PostgreSQL/Supabase connection pool from database.py.
-# It does not replace the legacy `user_logs` table; it adds a richer
-# analytics_events table for the admin dashboard.
+# Source tables (all created by database.initialize(), nothing new is needed):
+#   analytics_events   one row per bot event (event_details holds a JSON "meta" blob)
+#   quiz_analytics     finished quizzes   -> exposed to the dashboard as `quiz_complete` events
+#   resume_analytics   ATS scores         -> exposed to the dashboard as `ats_score` events
+#   system_errors      bot errors         -> merged into the Errors panel (recent_errors)
+#   users              registration date / phone list
+#
+# The dashboard functions below query ONE read-only view, `v_events`, that
+# merges those tables into a single event stream. init_analytics_db() creates
+# or refreshes that view on startup (CREATE OR REPLACE VIEW, safe to repeat).
+# Dedicated-table rows are skipped when the bot ALSO logged the same event in
+# analytics_events within 2 minutes, so nothing is double counted.
 
 import os
 import re
 import json
-import database as db
-from contextlib import contextmanager
-from psycopg2.extras import RealDictCursor
+import threading
 from datetime import datetime, timedelta
+from decimal import Decimal
 
-DB_NAME = os.getenv("ANALYTICS_DB_PATH", "bot_analytics.db")
+import psycopg2
+import psycopg2.extras
+import psycopg2.extensions
+import psycopg2.pool
 
-
+# Kept so older imports (`from analytics import DB_NAME`) don't crash. Unused.
+DB_NAME = "postgres"
 
 # Commands considered "a feature" vs plumbing commands, used by the funnel
 CAREER_FEATURE_COMMANDS = {
@@ -25,97 +36,221 @@ CAREER_FEATURE_COMMANDS = {
     "/prepare", "/job_search", "/roadmap", "/send", "/assistance", "/ats_score",
 }
 
+# ---------------------------------------------------------------------------
+# connection layer
+# ---------------------------------------------------------------------------
+# numeric/decimal -> float so Python arithmetic and JSON behave exactly like before
+_DEC2FLOAT = psycopg2.extensions.new_type(
+    psycopg2.extensions.DECIMAL.values, "DEC2FLOAT",
+    lambda v, cur: float(v) if v is not None else None)
+psycopg2.extensions.register_type(_DEC2FLOAT)
 
-class _Result:
-    """Small result wrapper so existing dashboard code can consume dict rows."""
-    def __init__(self, cursor):
-        self._cursor = cursor
 
+class Row(dict):
+    """dict row that also supports row[0] style access (like sqlite3.Row)."""
+    def __getitem__(self, k):
+        if isinstance(k, int):
+            return list(self.values())[k]
+        return dict.__getitem__(self, k)
+
+
+class _RowCursor(psycopg2.extras.RealDictCursor):
     def fetchone(self):
-        try:
-            return self._cursor.fetchone()
-        finally:
-            self._cursor.close()
+        r = super().fetchone()
+        return Row(r) if r is not None else None
 
     def fetchall(self):
-        try:
-            return self._cursor.fetchall()
-        finally:
-            self._cursor.close()
+        return [Row(r) for r in super().fetchall()]
+
+    def fetchmany(self, size=None):
+        return [Row(r) for r in super().fetchmany(size)]
 
     def __iter__(self):
+        return iter(self.fetchall())
+
+
+_POOL = None
+_POOL_LOCK = threading.Lock()
+
+
+def _pool():
+    global _POOL
+    if _POOL is None:
+        with _POOL_LOCK:
+            if _POOL is None:
+                url = os.getenv("DATABASE_URL")
+                if not url:
+                    raise RuntimeError("DATABASE_URL environment variable is not set.")
+                _POOL = psycopg2.pool.ThreadedConnectionPool(
+                    1, int(os.getenv("ANALYTICS_DB_POOL", "5")), url,
+                    connect_timeout=10)
+    return _POOL
+
+
+_FMT_SUBSTR = {  # sqlite strftime formats actually used by the queries
+    "%Y-%m-%d %H:%M:%S": (1, 19), "%Y-%m-%d %H": (1, 13), "%Y-%m-%d": (1, 10),
+    "%Y-%m": (1, 7), "%H": (12, 2), "%H:%M": (12, 5), "%w": None,
+}
+_NOW_UTC = "(now() AT TIME ZONE 'UTC')"
+_TS_FMT = "'YYYY-MM-DD HH24:MI:SS'"
+
+
+def _strftime(m):
+    fmt, expr = m.group(1), m.group(2).strip()
+    if fmt == "%w":  # weekday 0=Sunday, like sqlite
+        return f"EXTRACT(DOW FROM ({expr})::timestamp)::int::text"
+    rng = _FMT_SUBSTR.get(fmt)
+    if rng is None:
+        raise ValueError(f"unsupported strftime format {fmt}")
+    return f"substr({expr}, {rng[0]}, {rng[1]})"
+
+
+def _dt_now(m):
+    n, unit = int(m.group(1)), m.group(2)
+    unit = unit.rstrip("s")
+    return f"to_char({_NOW_UTC} - interval '{abs(n)} {unit}', {_TS_FMT})" if n < 0 else \
+           f"to_char({_NOW_UTC} + interval '{n} {unit}', {_TS_FMT})"
+
+
+def _translate(sql: str, has_params: bool) -> str:
+    """Rewrites the few SQLite-isms the dashboard queries use into Postgres SQL."""
+    sql = re.sub(r"strftime\(\s*'([^']*)'\s*,\s*((?:[^()]|\([^()]*\))*)\)", _strftime, sql)
+    sql = re.sub(r"datetime\('now'\s*,\s*'([+-]?\d+)\s*(day|days|hour|hours|minute|minutes)'\)", _dt_now, sql)
+    sql = re.sub(r"datetime\('now'\)", f"to_char({_NOW_UTC}, {_TS_FMT})", sql)
+    sql = re.sub(r"date\('now'\s*,\s*'([+-]?\d+)\s*(day|days)'\)",
+                 lambda m: f"to_char({_NOW_UTC} + interval '{int(m.group(1))} day', 'YYYY-MM-DD')", sql)
+    sql = re.sub(r"date\('now'\)", f"to_char({_NOW_UTC}, 'YYYY-MM-DD')", sql)
+    # sqlite dates are plain 'YYYY-MM-DD' strings; keep them text so comparisons behave identically
+    sql = re.sub(r"\bdate\(((?:[^()]|\([^()]*\))*)\)", r"substr(\1, 1, 10)", sql, flags=re.I)
+    sql = re.sub(r"julianday\('now'\)", f"(EXTRACT(EPOCH FROM {_NOW_UTC}) / 86400.0)", sql)
+    sql = re.sub(r"julianday\(((?:[^()]|\([^()]*\))*)\)", r"(EXTRACT(EPOCH FROM (\1)::timestamp) / 86400.0)", sql)
+    sql = re.sub(r"\bIFNULL\(", "COALESCE(", sql, flags=re.I)
+    sql = re.sub(r"\banalytics_events\b", "v_events", sql)
+    if has_params:
+        sql = sql.replace("%", "%%").replace("?", "%s")
+    return sql
+
+
+class _Conn:
+    """sqlite3-style facade over a pooled psycopg2 connection:
+       `with _conn() as conn: conn.execute(sql, params).fetchone()`."""
+    def __init__(self):
+        self._pool = _pool()
+        self._c = self._pool.getconn()
+        self._c.autocommit = False
+
+    def execute(self, sql, params=None):
+        cur = self._c.cursor(cursor_factory=_RowCursor)
+        params = tuple(params) if params else None
+        cur.execute(_translate(sql, params is not None), params)
+        return cur
+
+    def raw(self, sql, params=None):  # no translation (DDL / writes)
+        cur = self._c.cursor(cursor_factory=_RowCursor)
+        cur.execute(sql, params)
+        return cur
+
+    def commit(self):
+        self._c.commit()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
         try:
-            return iter(self._cursor.fetchall())
+            if exc_type:
+                self._c.rollback()
+            else:
+                self._c.commit()
         finally:
-            self._cursor.close()
+            self._pool.putconn(self._c)
+        return False
 
 
-class _ConnectionAdapter:
-    """Execute every statement through a psycopg2 dictionary cursor."""
-    def __init__(self, connection):
-        self._connection = connection
-
-    def execute(self, query, params=()):
-        cursor = self._connection.cursor(cursor_factory=RealDictCursor)
-        cursor.execute(query, params)
-        return _Result(cursor)
-
-
-@contextmanager
 def _conn():
-    # Use the project's shared PostgreSQL/Supabase connection pool.
-    with db.get_connection() as connection:
-        yield _ConnectionAdapter(connection)
+    return _Conn()
 
 
-def _parse_meta(value):
-    """JSONB may already be a dict; older rows may still contain JSON text."""
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, list):
-        return {"items": value}
-    if not value:
-        return {}
-    try:
-        return json.loads(value)
-    except (TypeError, json.JSONDecodeError):
-        return {}
+_VIEW_SQL = """
+CREATE OR REPLACE VIEW v_events AS
+SELECT e.id::bigint AS id, e.user_phone, e.event_type, e.command,
+       CASE WHEN e.event_details IS NULL OR btrim(e.event_details) = '' THEN '{}'
+            WHEN btrim(e.event_details) LIKE '{%' THEN e.event_details
+            ELSE json_build_object('message', e.event_details)::text END AS meta,
+       CASE WHEN e.success IS FALSE THEN 0 ELSE 1 END AS success,
+       e.response_time::float8 AS response_time_ms,
+       to_char(e.timestamp AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS "timestamp"
+  FROM analytics_events e
+ WHERE e.user_phone IS NOT NULL
+UNION ALL
+SELECT 1000000000 + q.id, q.user_phone, 'quiz_complete', '/quiz',
+       json_build_object('topic', q.topic, 'score', COALESCE(q.score, 0),
+                         'total', COALESCE(q.attempted, 0))::text,
+       1, NULL::float8, to_char(q.timestamp AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')
+  FROM quiz_analytics q
+ WHERE q.user_phone IS NOT NULL AND q.completed IS TRUE
+   AND NOT EXISTS (SELECT 1 FROM analytics_events x
+                    WHERE x.user_phone = q.user_phone AND x.event_type = 'quiz_complete'
+                      AND abs(extract(epoch FROM (x.timestamp - q.timestamp))) < 120)
+UNION ALL
+SELECT 2000000000 + r.id, r.user_phone, 'ats_score', '/ats_score',
+       json_build_object('score', r.ats_score, 'analysis_type', r.analysis_type)::text,
+       1, NULL::float8, to_char(r.timestamp AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')
+  FROM resume_analytics r
+ WHERE r.user_phone IS NOT NULL AND r.ats_score IS NOT NULL
+   AND NOT EXISTS (SELECT 1 FROM analytics_events x
+                    WHERE x.user_phone = r.user_phone AND x.event_type = 'ats_score'
+                      AND abs(extract(epoch FROM (x.timestamp - r.timestamp))) < 120)
+"""
 
 
 def init_analytics_db():
-    """Creates analytics_events if it doesn't exist yet. Safe to call every startup."""
+    """Makes sure the columns the dashboard needs exist and (re)creates the
+    v_events view. Safe to call on every startup. Never drops or alters data."""
     with _conn() as conn:
-        conn.execute('''
-            CREATE TABLE IF NOT EXISTS analytics_events (
-                id BIGSERIAL PRIMARY KEY,
-                user_phone TEXT NOT NULL,
-                event_type TEXT NOT NULL,
-                command TEXT,
-                meta JSONB,
-                success SMALLINT DEFAULT 1,
-                response_time_ms INTEGER,
-                timestamp TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_events_phone ON analytics_events(user_phone)')
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_events_type ON analytics_events(event_type)')
-        conn.execute('CREATE INDEX IF NOT EXISTS idx_events_ts ON analytics_events(timestamp)')
-        #conn.commit()
+        conn.raw("""CREATE TABLE IF NOT EXISTS users (
+                        phone TEXT PRIMARY KEY, resume TEXT, state TEXT, doc_text TEXT,
+                        created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW())""")
+        conn.raw("""CREATE TABLE IF NOT EXISTS analytics_events (
+                        id SERIAL PRIMARY KEY,
+                        user_phone TEXT REFERENCES users(phone) ON DELETE SET NULL,
+                        event_type TEXT NOT NULL, command TEXT, success BOOLEAN DEFAULT TRUE,
+                        response_time DOUBLE PRECISION,
+                        timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW())""")
+        conn.raw("""CREATE TABLE IF NOT EXISTS resume_analytics (
+                        id SERIAL PRIMARY KEY, user_phone TEXT REFERENCES users(phone) ON DELETE SET NULL,
+                        ats_score INTEGER, analysis_type TEXT,
+                        timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW())""")
+        conn.raw("""CREATE TABLE IF NOT EXISTS quiz_analytics (
+                        id SERIAL PRIMARY KEY, user_phone TEXT REFERENCES users(phone) ON DELETE SET NULL,
+                        topic TEXT, score INTEGER, completed BOOLEAN DEFAULT FALSE,
+                        timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW())""")
+        conn.raw("""CREATE TABLE IF NOT EXISTS system_errors (
+                        id SERIAL PRIMARY KEY, error_type TEXT, details TEXT,
+                        timestamp TIMESTAMP WITH TIME ZONE DEFAULT NOW())""")
+        # columns database.py's log functions already write but initialize() doesn't create
+        conn.raw("ALTER TABLE analytics_events ADD COLUMN IF NOT EXISTS event_details TEXT")
+        conn.raw("ALTER TABLE quiz_analytics ADD COLUMN IF NOT EXISTS attempted INTEGER")
+        conn.raw("CREATE INDEX IF NOT EXISTS idx_events_phone ON analytics_events(user_phone)")
+        conn.raw("CREATE INDEX IF NOT EXISTS idx_events_type ON analytics_events(event_type)")
+        conn.raw("CREATE INDEX IF NOT EXISTS idx_events_ts ON analytics_events(timestamp)")
+        conn.raw(_VIEW_SQL)
 
 
 def log_event(phone: str, event_type: str, command: str = None, meta: dict = None,
               success: bool = True, response_time_ms: int = None):
     """Records one analytics event. Never raises — a logging failure should
-    never break the bot's actual reply to the user."""
+    never break the bot's actual reply to the user. meta is stored as JSON in
+    analytics_events.event_details; response_time stores milliseconds."""
     try:
         with _conn() as conn:
-            conn.execute(
-                '''INSERT INTO analytics_events
-                   (user_phone, event_type, command, meta, success, response_time_ms)
-                   VALUES (%s, %s, %s, %s::jsonb, %s, %s)''',
-                (phone, event_type, command, json.dumps(meta or {}), 1 if success else 0, response_time_ms)
-            )
-            #conn.commit()
+            # analytics_events.user_phone is a foreign key to users(phone)
+            conn.raw("INSERT INTO users (phone, resume, state, doc_text) VALUES (%s, '', '{}', '') "
+                     "ON CONFLICT (phone) DO NOTHING", (phone,))
+            conn.raw("""INSERT INTO analytics_events
+                        (user_phone, event_type, command, event_details, success, response_time)
+                        VALUES (%s, %s, %s, %s, %s, %s)""",
+                     (phone, event_type, command, json.dumps(meta or {}), bool(success), response_time_ms))
     except Exception:
         pass
 
@@ -126,9 +261,9 @@ def extract_score(text: str):
     if not text:
         return None
     patterns = [
-        r'(%s:score|ats score)[^\d]{0,10}(\d{1,3})\s*%',
-        r'(%s:score|ats score)[^\d]{0,10}(\d{1,3})\s*/\s*100',
-        r'(\d{1,3})\s*%\s*(%s:ats|match)',
+        r'(?:score|ats score)[^\d]{0,10}(\d{1,3})\s*%',
+        r'(?:score|ats score)[^\d]{0,10}(\d{1,3})\s*/\s*100',
+        r'(\d{1,3})\s*%\s*(?:ats|match)',
         r'(\d{1,3})\s*/\s*100',
     ]
     for p in patterns:
@@ -146,11 +281,11 @@ def extract_score(text: str):
 def _range_clause(start: str = None, end: str = None, date: str = None):
     """Returns (sql_clause, params) for filtering analytics_events.timestamp."""
     if date:
-        return "timestamp::date = %s", (date,)
+        return "date(timestamp) = ?", (date,)
     if start and end:
-        return "timestamp::date BETWEEN %s AND %s", (start, end)
+        return "date(timestamp) BETWEEN ? AND ?", (start, end)
     if start:
-        return "timestamp::date >= %s", (start,)
+        return "date(timestamp) >= ?", (start,)
     return "1=1", ()
 
 
@@ -167,12 +302,12 @@ def overview(date: str = None):
         ).fetchone()["c"]
 
         today_users = conn.execute(
-            "SELECT COUNT(DISTINCT user_phone) c FROM analytics_events WHERE timestamp::date = %s",
+            "SELECT COUNT(DISTINCT user_phone) c FROM analytics_events WHERE date(timestamp) = ?",
             (date or today,)
         ).fetchone()["c"]
 
         active_users = conn.execute(
-            "SELECT COUNT(DISTINCT user_phone) c FROM analytics_events WHERE timestamp::date >= %s",
+            "SELECT COUNT(DISTINCT user_phone) c FROM analytics_events WHERE date(timestamp) >= ?",
             (week_ago,)
         ).fetchone()["c"]
 
@@ -198,11 +333,11 @@ def new_vs_returning(date: str = None):
     day = date or datetime.now().strftime("%Y-%m-%d")
     with _conn() as conn:
         active_today = {r["user_phone"] for r in conn.execute(
-            "SELECT DISTINCT user_phone FROM analytics_events WHERE timestamp::date = %s", (day,)
+            "SELECT DISTINCT user_phone FROM analytics_events WHERE date(timestamp) = ?", (day,)
         )}
         first_seen_today = {r["user_phone"] for r in conn.execute(
             '''SELECT user_phone FROM analytics_events
-               GROUP BY user_phone HAVING MIN(timestamp)::date = %s''', (day,)
+               GROUP BY user_phone HAVING date(MIN(timestamp)) = ?''', (day,)
         )}
     new_users = len(active_today & first_seen_today)
     returning = len(active_today) - new_users
@@ -212,9 +347,9 @@ def new_vs_returning(date: str = None):
 def monthly_growth(months: int = 6):
     with _conn() as conn:
         rows = conn.execute(
-            '''SELECT TO_CHAR(timestamp, 'YYYY-MM') ym, COUNT(DISTINCT user_phone) c
+            '''SELECT strftime('%Y-%m', timestamp) ym, COUNT(DISTINCT user_phone) c
                FROM analytics_events
-               GROUP BY ym ORDER BY ym DESC LIMIT %s''', (months,)
+               GROUP BY ym ORDER BY ym DESC LIMIT ?''', (months,)
         ).fetchall()
     data = [{"month": r["ym"], "users": r["c"]} for r in rows]
     return list(reversed(data))
@@ -224,7 +359,7 @@ def daily_activity(start: str = None, end: str = None):
     clause, params = _range_clause(start, end)
     with _conn() as conn:
         rows = conn.execute(
-            f'''SELECT timestamp::date d, COUNT(DISTINCT user_phone) users, COUNT(*) messages
+            f'''SELECT date(timestamp) d, COUNT(DISTINCT user_phone) users, COUNT(*) messages
                 FROM analytics_events WHERE {clause}
                 GROUP BY d ORDER BY d''', params
         ).fetchall()
@@ -235,7 +370,7 @@ def hourly_activity(date: str = None, start: str = None, end: str = None):
     clause, params = _range_clause(start, end, date)
     with _conn() as conn:
         rows = conn.execute(
-            f'''SELECT TO_CHAR(timestamp, 'HH24') h, COUNT(*) c
+            f'''SELECT strftime('%H', timestamp) h, COUNT(*) c
                 FROM analytics_events WHERE {clause}
                 GROUP BY h ORDER BY h''', params
         ).fetchall()
@@ -251,7 +386,7 @@ def feature_usage(date: str = None, start: str = None, end: str = None):
         rows = conn.execute(
             f'''SELECT command, COUNT(*) c FROM analytics_events
                 WHERE event_type = 'command' AND command IS NOT NULL AND {clause}
-                GROUP BY command ORDER BY c DESC''', params
+                GROUP BY command ORDER BY c DESC, command''', params
         ).fetchall()
     total = sum(r["c"] for r in rows) or 1
     usage = [{"command": r["command"], "count": r["c"], "pct": round(r["c"] * 100 / total, 1)} for r in rows]
@@ -264,7 +399,7 @@ def resume_analytics():
             "SELECT COUNT(*) c FROM analytics_events WHERE event_type = 'resume_upload'"
         ).fetchone()["c"]
         scores = [
-            _parse_meta(r["meta"]).get("score")
+            json.loads(r["meta"] or "{}").get("score")
             for r in conn.execute(
                 "SELECT meta FROM analytics_events WHERE event_type = 'ats_score' AND success = 1"
             )
@@ -303,7 +438,7 @@ def job_search_analytics():
     users = set()
     for r in rows:
         users.add(r["user_phone"])
-        topic = _parse_meta(r["meta"]).get("topic")
+        topic = json.loads(r["meta"] or "{}").get("topic")
         if topic:
             topics[topic] = topics.get(topic, 0) + 1
     popular = sorted(topics.items(), key=lambda x: -x[1])[:5]
@@ -326,7 +461,7 @@ def quiz_analytics():
 
     scores_pct, topics, questions_answered = [], {}, 0
     for r in completed_rows:
-        m = _parse_meta(r["meta"])
+        m = json.loads(r["meta"] or "{}")
         score, total, topic = m.get("score"), m.get("total"), m.get("topic")
         if isinstance(score, (int, float)) and isinstance(total, (int, float)) and total > 0:
             scores_pct.append(score * 100 / total)
@@ -372,7 +507,7 @@ def ai_usage():
     with _conn() as conn:
         def count(event_type):
             return conn.execute(
-                "SELECT COUNT(*) c FROM analytics_events WHERE event_type = %s", (event_type,)
+                "SELECT COUNT(*) c FROM analytics_events WHERE event_type = ?", (event_type,)
             ).fetchone()["c"]
 
         return {
@@ -385,18 +520,22 @@ def ai_usage():
 
 
 def recent_errors(limit: int = 10):
+    _ERR = """(SELECT event_type, meta, timestamp FROM analytics_events WHERE success = 0
+               UNION ALL
+               SELECT 'error', json_build_object('message', COALESCE(error_type,'') ||
+                      CASE WHEN details IS NULL THEN '' ELSE ': ' || details END)::text,
+                      to_char(timestamp AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') FROM system_errors) e"""
     with _conn() as conn:
         rows = conn.execute(
-            '''SELECT event_type, meta, timestamp FROM analytics_events
-               WHERE success = 0 ORDER BY timestamp DESC LIMIT %s''', (limit,)
+            f"SELECT event_type, meta, timestamp FROM {_ERR} ORDER BY timestamp DESC LIMIT ?", (limit,)
         ).fetchall()
         errors_today = conn.execute(
-            "SELECT COUNT(*) c FROM analytics_events WHERE success = 0 AND timestamp::date = CURRENT_DATE"
+            f"SELECT COUNT(*) c FROM {_ERR} WHERE date(timestamp) = date('now')"
         ).fetchone()["c"]
 
     items = []
     for r in rows:
-        m = _parse_meta(r["meta"])
+        m = json.loads(r["meta"] or "{}")
         items.append({
             "time": r["timestamp"],
             "stage": r["event_type"],
@@ -421,16 +560,16 @@ def users_summary(start: str = None, end: str = None):
 
         first_seen_in_range = {r["user_phone"] for r in conn.execute(
             f'''SELECT user_phone FROM analytics_events
-                GROUP BY user_phone HAVING MIN(timestamp)::date BETWEEN
-                coalesce(%s, '0001-01-01') AND coalesce(%s, CURRENT_DATE)''',
+                GROUP BY user_phone HAVING date(MIN(timestamp)) BETWEEN
+                coalesce(?, '0001-01-01') AND coalesce(?, date('now'))''',
             (start, end or start)
         )} if (start or end) else {r["user_phone"] for r in conn.execute(
             '''SELECT user_phone FROM analytics_events
-               GROUP BY user_phone HAVING MIN(timestamp)::date >= %s''', (week_ago,)
+               GROUP BY user_phone HAVING date(MIN(timestamp)) >= ?''', (week_ago,)
         )}
 
         active_7d = conn.execute(
-            "SELECT COUNT(DISTINCT user_phone) c FROM analytics_events WHERE timestamp::date >= %s",
+            "SELECT COUNT(DISTINCT user_phone) c FROM analytics_events WHERE date(timestamp) >= ?",
             (week_ago,)
         ).fetchone()["c"]
 
@@ -452,24 +591,24 @@ def users_timeseries(start: str = None, end: str = None):
     clause, params = _range_clause(start, end)
     with _conn() as conn:
         days = [r["d"] for r in conn.execute(
-            f"SELECT DISTINCT timestamp::date d FROM analytics_events WHERE {clause} ORDER BY d", params
+            f"SELECT DISTINCT date(timestamp) d FROM analytics_events WHERE {clause} ORDER BY d", params
         )]
         first_seen = {}
         for r in conn.execute(
-            "SELECT user_phone, MIN(timestamp)::date d FROM analytics_events GROUP BY user_phone"
+            "SELECT user_phone, date(MIN(timestamp)) d FROM analytics_events GROUP BY user_phone"
         ):
             first_seen.setdefault(r["d"], 0)
             first_seen[r["d"]] += 1
 
         active_by_day = {}
         for r in conn.execute(
-            f'''SELECT timestamp::date d, COUNT(DISTINCT user_phone) c
+            f'''SELECT date(timestamp) d, COUNT(DISTINCT user_phone) c
                 FROM analytics_events WHERE {clause} GROUP BY d''', params
         ):
             active_by_day[r["d"]] = r["c"]
 
         total_before = conn.execute(
-            "SELECT COUNT(DISTINCT user_phone) c FROM analytics_events WHERE timestamp::date < %s",
+            "SELECT COUNT(DISTINCT user_phone) c FROM analytics_events WHERE date(timestamp) < ?",
             (days[0] if days else datetime.now().strftime("%Y-%m-%d"),)
         ).fetchone()["c"] if days else 0
 
@@ -508,10 +647,10 @@ def users_activity_stats():
         total_messages = conn.execute("SELECT COUNT(*) c FROM analytics_events").fetchone()["c"]
         total_users = conn.execute("SELECT COUNT(DISTINCT user_phone) c FROM analytics_events").fetchone()["c"]
         active_sessions = conn.execute(
-            "SELECT COUNT(DISTINCT user_phone) c FROM analytics_events WHERE timestamp >= (NOW() - INTERVAL '30 minutes')"
+            "SELECT COUNT(DISTINCT user_phone) c FROM analytics_events WHERE timestamp >= datetime('now','-30 minutes')"
         ).fetchone()["c"]
         recency_rows = conn.execute(
-            '''SELECT (EXTRACT(EPOCH FROM (NOW() - MAX(timestamp))) / 86400.0) d
+            '''SELECT (julianday('now') - julianday(MAX(timestamp))) d
                FROM analytics_events GROUP BY user_phone'''
         ).fetchall()
 
@@ -527,7 +666,7 @@ def users_activity_stats():
 
 
 def list_users(limit: int = 20, offset: int = 0, search: str = None):
-    where = "WHERE user_phone LIKE %s" if search else ""
+    where = "WHERE user_phone LIKE ?" if search else ""
     params = (f"%{search}%",) if search else ()
     with _conn() as conn:
         total = conn.execute(
@@ -542,8 +681,8 @@ def list_users(limit: int = 20, offset: int = 0, search: str = None):
                 FROM analytics_events
                 {where}
                 GROUP BY user_phone
-                ORDER BY last_active DESC
-                LIMIT %s OFFSET %s''',
+                ORDER BY last_active DESC, user_phone
+                LIMIT ? OFFSET ?''',
             params + (limit, offset)
         ).fetchall()
 
@@ -569,8 +708,8 @@ def user_engagement(limit: int = 6):
                       SUM(CASE WHEN event_type = 'command' THEN 1 ELSE 0 END) commands
                FROM analytics_events
                GROUP BY user_phone
-               ORDER BY messages DESC
-               LIMIT %s''', (limit,)
+               ORDER BY messages DESC, user_phone
+               LIMIT ?''', (limit,)
         ).fetchall()
     out = []
     for i, r in enumerate(rows, start=1):
@@ -591,7 +730,7 @@ def popular_commands_by_users(limit: int = 5):
             '''SELECT command, COUNT(DISTINCT user_phone) users
                FROM analytics_events
                WHERE event_type = 'command' AND command IS NOT NULL
-               GROUP BY command ORDER BY users DESC LIMIT %s''', (limit,)
+               GROUP BY command ORDER BY users DESC, command LIMIT ?''', (limit,)
         ).fetchall()
         total_users = conn.execute("SELECT COUNT(DISTINCT user_phone) c FROM analytics_events").fetchone()["c"] or 1
     return [
@@ -604,73 +743,73 @@ def user_detail(phone: str, days: int = 30):
     with _conn() as conn:
         profile = conn.execute(
             '''SELECT MIN(timestamp) joined_on, MAX(timestamp) last_active, COUNT(*) total_messages
-               FROM analytics_events WHERE user_phone = %s''', (phone,)
+               FROM analytics_events WHERE user_phone = ?''', (phone,)
         ).fetchone()
         if not profile or profile["total_messages"] == 0:
             return None
 
         job_searches = conn.execute(
-            "SELECT COUNT(*) c FROM analytics_events WHERE user_phone = %s AND event_type = 'job_search'", (phone,)
+            "SELECT COUNT(*) c FROM analytics_events WHERE user_phone = ? AND event_type = 'job_search'", (phone,)
         ).fetchone()["c"]
         quiz_attempts = conn.execute(
-            "SELECT COUNT(*) c FROM analytics_events WHERE user_phone = %s AND event_type IN ('quiz_start')", (phone,)
+            "SELECT COUNT(*) c FROM analytics_events WHERE user_phone = ? AND event_type IN ('quiz_start')", (phone,)
         ).fetchone()["c"]
         resume_analyses = conn.execute(
-            "SELECT COUNT(*) c FROM analytics_events WHERE user_phone = %s AND event_type = 'ats_score' AND success = 1",
+            "SELECT COUNT(*) c FROM analytics_events WHERE user_phone = ? AND event_type = 'ats_score' AND success = 1",
             (phone,)
         ).fetchone()["c"]
         avg_rt = conn.execute(
-            "SELECT AVG(response_time_ms) a FROM analytics_events WHERE user_phone = %s AND response_time_ms IS NOT NULL",
+            "SELECT AVG(response_time_ms) a FROM analytics_events WHERE user_phone = ? AND response_time_ms IS NOT NULL",
             (phone,)
         ).fetchone()["a"]
 
         activity_rows = conn.execute(
-            '''SELECT timestamp::date d, COUNT(*) messages,
+            '''SELECT date(timestamp) d, COUNT(*) messages,
                       SUM(CASE WHEN event_type='command' THEN 1 ELSE 0 END) commands
-               FROM analytics_events WHERE user_phone = %s
+               FROM analytics_events WHERE user_phone = ?
                GROUP BY d ORDER BY d''', (phone,)
         ).fetchall()
 
         feature_rows = conn.execute(
             '''SELECT command, COUNT(*) c FROM analytics_events
-               WHERE user_phone = %s AND event_type = 'command' AND command IS NOT NULL
-               GROUP BY command ORDER BY c DESC''', (phone,)
+               WHERE user_phone = ? AND event_type = 'command' AND command IS NOT NULL
+               GROUP BY command ORDER BY c DESC, command''', (phone,)
         ).fetchall()
 
         funnel_used_feature = conn.execute(
             f'''SELECT COUNT(*) c FROM analytics_events
-                WHERE user_phone = %s AND event_type = 'command' AND command IN
-                ({",".join("%s" * len(CAREER_FEATURE_COMMANDS))})''',
+                WHERE user_phone = ? AND event_type = 'command' AND command IN
+                ({",".join("?" * len(CAREER_FEATURE_COMMANDS))})''',
             (phone, *CAREER_FEATURE_COMMANDS)
         ).fetchone()["c"]
         funnel_job_search = job_searches
         funnel_applied = conn.execute(
-            "SELECT COUNT(*) c FROM analytics_events WHERE user_phone = %s AND event_type = 'job_apply'", (phone,)
+            "SELECT COUNT(*) c FROM analytics_events WHERE user_phone = ? AND event_type = 'job_apply'", (phone,)
         ).fetchone()["c"]
 
         job_rows = conn.execute(
-            "SELECT meta, timestamp FROM analytics_events WHERE user_phone = %s AND event_type = 'job_search' ORDER BY timestamp DESC",
+            "SELECT meta, timestamp FROM analytics_events WHERE user_phone = ? AND event_type = 'job_search' ORDER BY timestamp DESC, id DESC",
             (phone,)
         ).fetchall()
 
         quiz_rows = conn.execute(
-            "SELECT meta, timestamp, event_type FROM analytics_events WHERE user_phone = %s AND event_type IN "
-            "('quiz_complete','quiz_exit_early') ORDER BY timestamp DESC", (phone,)
+            "SELECT meta, timestamp, event_type FROM analytics_events WHERE user_phone = ? AND event_type IN "
+            "('quiz_complete','quiz_exit_early') ORDER BY timestamp DESC, id DESC", (phone,)
         ).fetchall()
 
         resume_rows = conn.execute(
-            "SELECT meta, timestamp FROM analytics_events WHERE user_phone = %s AND event_type = 'ats_score' ORDER BY timestamp DESC",
+            "SELECT meta, timestamp FROM analytics_events WHERE user_phone = ? AND event_type = 'ats_score' ORDER BY timestamp DESC, id DESC",
             (phone,)
         ).fetchall()
 
         recent_events = conn.execute(
             '''SELECT event_type, command, meta, success, timestamp FROM analytics_events
-               WHERE user_phone = %s ORDER BY timestamp DESC LIMIT 25''', (phone,)
+               WHERE user_phone = ? ORDER BY timestamp DESC, id DESC LIMIT 25''', (phone,)
         ).fetchall()
 
         peak_row = conn.execute(
-            '''SELECT TO_CHAR(timestamp, 'HH24') h, COUNT(*) c FROM analytics_events
-               WHERE user_phone = %s GROUP BY h ORDER BY c DESC LIMIT 1''', (phone,)
+            '''SELECT strftime('%H', timestamp) h, COUNT(*) c FROM analytics_events
+               WHERE user_phone = ? GROUP BY h ORDER BY c DESC LIMIT 1''', (phone,)
         ).fetchone()
         active_days = len(activity_rows)
 
@@ -678,21 +817,21 @@ def user_detail(phone: str, days: int = 30):
 
     quiz_scores = []
     for r in quiz_rows:
-        m = _parse_meta(r["meta"])
+        m = json.loads(r["meta"] or "{}")
         score, total = m.get("score"), m.get("total")
         if isinstance(score, (int, float)) and isinstance(total, (int, float)) and total > 0:
             quiz_scores.append(score * 100 / total)
 
     resume_scores = []
     for r in resume_rows:
-        m = _parse_meta(r["meta"])
+        m = json.loads(r["meta"] or "{}")
         if isinstance(m.get("score"), (int, float)):
             resume_scores.append(m["score"])
 
     # --- aggregated views for the Job / Quiz / Resume tabs ---
     all_job_topics, job_last = {}, {}
     for r in job_rows:
-        t = _parse_meta(r["meta"]).get("topic") or "—"
+        t = json.loads(r["meta"] or "{}").get("topic") or "—"
         all_job_topics[t] = all_job_topics.get(t, 0) + 1
         job_last.setdefault(t, r["timestamp"])   # rows are newest-first
     job_total = sum(all_job_topics.values()) or 1
@@ -704,7 +843,7 @@ def user_detail(phone: str, days: int = 30):
     quiz_topic_pcts, quiz_completed = {}, 0
     quiz_topic_raw = {}
     for r in quiz_rows:
-        m = _parse_meta(r["meta"])
+        m = json.loads(r["meta"] or "{}")
         if r["event_type"] == "quiz_complete":
             quiz_completed += 1
         sc, tt = m.get("score"), m.get("total")
@@ -729,8 +868,8 @@ def user_detail(phone: str, days: int = 30):
     # resume file formats (only if the bot records filename/format in event meta)
     formats = {}
     with _conn() as conn:
-        for r in conn.execute("SELECT meta FROM analytics_events WHERE user_phone = %s AND event_type IN ('resume_upload','ats_score')", (phone,)):
-            m = _parse_meta(r["meta"])
+        for r in conn.execute("SELECT meta FROM analytics_events WHERE user_phone = ? AND event_type IN ('resume_upload','ats_score')", (phone,)):
+            m = json.loads(r["meta"] or "{}")
             fmt_ = m.get("format") or m.get("file_type")
             if not fmt_ and isinstance(m.get("filename"), str) and "." in m["filename"]:
                 fmt_ = m["filename"].rsplit(".", 1)[-1]
@@ -745,7 +884,7 @@ def user_detail(phone: str, days: int = 30):
 
     def _period(where, extra=""):
         with _conn() as conn:
-            q = f"SELECT COUNT(*) c, AVG(response_time_ms) a FROM analytics_events WHERE user_phone = %s {where} AND timestamp >= %s AND timestamp < %s"
+            q = f"SELECT COUNT(*) c, AVG(response_time_ms) a FROM analytics_events WHERE user_phone = ? {where} AND timestamp >= ? AND timestamp < ?"
             cur = conn.execute(q, (phone, cur_start, "9999-12-31 00:00:00")).fetchone()
             prev = conn.execute(q, (phone, prev_start, cur_start)).fetchone()
         return cur, prev
@@ -765,7 +904,7 @@ def user_detail(phone: str, days: int = 30):
     quiz_questions = sum(v[1] for v in quiz_topic_raw.values())
 
     def _describe(r):
-        m = _parse_meta(r["meta"])
+        m = json.loads(r["meta"] or "{}")
         et, cmd = r["event_type"], r["command"]
         if et == "job_search":
             return f"Searched for {m.get('topic') or 'jobs'}", "Job Search"
@@ -830,21 +969,21 @@ def user_detail(phone: str, days: int = 30):
             "distribution5": r_dist5,
         },
         "job_searches_list": [
-            {"topic": _parse_meta(r["meta"]).get("topic", "—"), "timestamp": r["timestamp"]}
+            {"topic": json.loads(r["meta"] or "{}").get("topic", "—"), "timestamp": r["timestamp"]}
             for r in job_rows[:20]
         ],
         "quiz_list": [
             {
-                "topic": _parse_meta(r["meta"]).get("topic", "—"),
-                "score": _parse_meta(r["meta"]).get("score"),
-                "total": _parse_meta(r["meta"]).get("total"),
+                "topic": json.loads(r["meta"] or "{}").get("topic", "—"),
+                "score": json.loads(r["meta"] or "{}").get("score"),
+                "total": json.loads(r["meta"] or "{}").get("total"),
                 "status": "Passed" if r["event_type"] == "quiz_complete" else "Exited early",
                 "timestamp": r["timestamp"],
             }
             for r in quiz_rows[:20]
         ],
         "resume_list": [
-            {"score": _parse_meta(r["meta"]).get("score"), "timestamp": r["timestamp"]}
+            {"score": json.loads(r["meta"] or "{}").get("score"), "timestamp": r["timestamp"]}
             for r in resume_rows[:20]
         ],
         "messages": [
@@ -956,23 +1095,23 @@ def system_metrics(log_limit: int = 5):
             r = conn.execute(
                 f"""SELECT COUNT(*) n, SUM(CASE WHEN success=1 THEN 1 ELSE 0 END) ok,
                            AVG(response_time_ms) ms FROM analytics_events
-                    WHERE timestamp >= (NOW() - (INTERVAL '1 day' * {days})) AND {where}""", params).fetchone()
+                    WHERE timestamp >= datetime('now','-{days} day') AND {where}""", params).fetchone()
             n = r["n"] or 0
             return {"n": n, "rate": round((r["ok"] or 0) * 100 / n, 1) if n else None,
                     "ms": round(r["ms"]) if r["ms"] is not None else None}
 
         allev = stats("1=1")
         cmd = stats("event_type='command'")
-        ai = stats("event_type IN (%s,%s,%s)", AI_TYPES)
+        ai = stats("event_type IN (?,?,?)", AI_TYPES)
         jobs = stats("event_type='job_search'")
         recent_webhook = conn.execute(
-            "SELECT COUNT(*) c FROM analytics_events WHERE timestamp >= (NOW() - INTERVAL '\1 hour')").fetchone()["c"]
+            "SELECT COUNT(*) c FROM analytics_events WHERE timestamp >= datetime('now','-1 hour')").fetchone()["c"]
         hours_active = conn.execute(
-            """SELECT COUNT(DISTINCT TO_CHAR(timestamp, 'YYYY-MM-DD HH24')) c FROM analytics_events
-               WHERE timestamp >= (NOW() - INTERVAL '\1 hour')""").fetchone()["c"]
+            """SELECT COUNT(DISTINCT strftime('%Y-%m-%d %H', timestamp)) c FROM analytics_events
+               WHERE timestamp >= datetime('now','-24 hour')""").fetchone()["c"]
         recent_logs = conn.execute(
             """SELECT event_type, command, meta, success, timestamp FROM analytics_events
-               ORDER BY timestamp DESC LIMIT %s""", (log_limit,)).fetchall()
+               ORDER BY timestamp DESC, id DESC LIMIT ?""", (log_limit,)).fetchall()
 
     def up(rate):  # uptime proxy: share of successful events in the last 7 days
         return rate if rate is not None else 100.0
@@ -982,10 +1121,10 @@ def system_metrics(log_limit: int = 5):
     api_ms = round(db_response_ms + 1.0, 1)
     services = [
         {"name": "Bot API (FastAPI)", "key": "api", "status": "Healthy", "response_ms": api_ms, "uptime_pct": up(allev["rate"])},
-        {"name": "Database (PostgreSQL/Supabase)", "key": "db", "status": "Healthy" if db_response_ms < 500 else "Slow",
+        {"name": "Database (PostgreSQL)", "key": "db", "status": "Healthy" if db_response_ms < 500 else "Slow",
          "response_ms": db_response_ms, "uptime_pct": 100.0},
         {"name": "WhatsApp Webhook", "key": "whatsapp", "status": "Healthy" if recent_webhook > 0 else "Idle",
-         "response_ms": cmd["ms"], "uptime_pct": round(hours_active * 100 / 24, 1)},
+         "response_ms": cmd["ms"], "uptime_pct": min(100.0, round(hours_active * 100 / 24, 1))},
         {"name": "NVIDIA NIM (Kimi)", "key": "ai", "status": "Healthy" if ai_ok else "Degraded",
          "response_ms": ai["ms"], "uptime_pct": up(ai["rate"])},
         {"name": "External APIs", "key": "external", "status": "Healthy" if job_ok else "Degraded",
@@ -995,7 +1134,7 @@ def system_metrics(log_limit: int = 5):
 
     logs = []
     for r in recent_logs:
-        m = _parse_meta(r["meta"])
+        m = json.loads(r["meta"] or "{}")
         logs.append({
             "time": r["timestamp"],
             "success": bool(r["success"]),
@@ -1052,7 +1191,7 @@ def funnel():
         total_users = distinct("1=1")
         used_feature = distinct("event_type = 'command'")
         career = distinct(
-            f"event_type = 'command' AND lower(command) IN ({','.join('%s' * len(DASHBOARD_CAREER_COMMANDS))})",
+            f"event_type = 'command' AND lower(command) IN ({','.join('?' * len(DASHBOARD_CAREER_COMMANDS))})",
             DASHBOARD_CAREER_COMMANDS,
         )
         job_search = distinct("event_type = 'job_search'")
@@ -1089,7 +1228,7 @@ def _cumulative_users_at(conn, end_date: str) -> int:
     return conn.execute(
         '''SELECT COUNT(*) c FROM (
                SELECT user_phone FROM analytics_events
-               GROUP BY user_phone HAVING MIN(timestamp)::date <= %s
+               GROUP BY user_phone HAVING date(MIN(timestamp)) <= ?
            )''', (end_date,)
     ).fetchone()["c"]
 
@@ -1101,7 +1240,7 @@ def _metric_value(conn, metric: str, start: str, end: str):
         row = conn.execute(
             '''SELECT AVG(response_time_ms) v FROM analytics_events
                WHERE event_type = 'command' AND response_time_ms IS NOT NULL
-                 AND timestamp::date BETWEEN %s AND %s''', (start, end)
+                 AND date(timestamp) BETWEEN ? AND ?''', (start, end)
         ).fetchone()
         return round(row["v"], 0) if row["v"] is not None else 0
     if metric == "success_rate":
@@ -1111,25 +1250,25 @@ def _metric_value(conn, metric: str, start: str, end: str):
                    COUNT(*) total
                FROM analytics_events
                WHERE event_type IN ('command','ats_score','resume_upload','job_search','roadmap','quiz_start','ai_assistance')
-                 AND timestamp::date BETWEEN %s AND %s''', (start, end)
+                 AND date(timestamp) BETWEEN ? AND ?''', (start, end)
         ).fetchone()
         return round((row["ok"] / row["total"]) * 100, 1) if row["total"] else 100.0
 
     if metric in ("new_users", "active_users", "returning_users"):
         active = conn.execute(
             '''SELECT COUNT(DISTINCT user_phone) c FROM analytics_events
-               WHERE timestamp::date BETWEEN %s AND %s''', (start, end)).fetchone()["c"]
+               WHERE date(timestamp) BETWEEN ? AND ?''', (start, end)).fetchone()["c"]
         new = conn.execute(
             '''SELECT COUNT(*) c FROM (SELECT user_phone FROM analytics_events
-               GROUP BY user_phone HAVING MIN(timestamp)::date BETWEEN %s AND %s)''', (start, end)).fetchone()["c"]
+               GROUP BY user_phone HAVING date(MIN(timestamp)) BETWEEN ? AND ?)''', (start, end)).fetchone()["c"]
         return {"active_users": active, "new_users": new, "returning_users": max(active - new, 0)}[metric]
 
     if metric in ("cmd_internships", "cmd_competitions"):
         like = "/internship%" if metric == "cmd_internships" else "/competition%"
         return conn.execute(
             '''SELECT COUNT(*) c FROM analytics_events
-               WHERE event_type = 'command' AND lower(command) LIKE %s
-                 AND timestamp::date BETWEEN %s AND %s''', (like, start, end)
+               WHERE event_type = 'command' AND lower(command) LIKE ?
+                 AND date(timestamp) BETWEEN ? AND ?''', (like, start, end)
         ).fetchone()["c"]
 
     event_type = _TREND_EVENT_TYPE.get(metric)
@@ -1138,11 +1277,11 @@ def _metric_value(conn, metric: str, start: str, end: str):
     if event_type:
         return conn.execute(
             '''SELECT COUNT(*) c FROM analytics_events
-               WHERE event_type = %s AND timestamp::date BETWEEN %s AND %s''',
+               WHERE event_type = ? AND date(timestamp) BETWEEN ? AND ?''',
             (event_type, start, end)
         ).fetchone()["c"]
     return conn.execute(
-        '''SELECT COUNT(*) c FROM analytics_events WHERE timestamp::date BETWEEN %s AND %s''',
+        '''SELECT COUNT(*) c FROM analytics_events WHERE date(timestamp) BETWEEN ? AND ?''',
         (start, end)
     ).fetchone()["c"]
 
@@ -1193,7 +1332,7 @@ def resume_detail(start: str = None, end: str = None):
         rows = conn.execute(
             f'''SELECT user_phone, meta, success, timestamp FROM analytics_events
                 WHERE event_type = 'ats_score' AND {clause}
-                ORDER BY timestamp DESC''', params
+                ORDER BY timestamp DESC, id DESC''', params
         ).fetchall()
         uploads = conn.execute(
             f"SELECT COUNT(*) c FROM analytics_events WHERE event_type='resume_upload' AND {clause}", params
@@ -1201,10 +1340,10 @@ def resume_detail(start: str = None, end: str = None):
 
     by_day, recent = {}, []
     for r in rows:
-        score = _parse_meta(r["meta"]).get("score")
+        score = json.loads(r["meta"] or "{}").get("score")
         score = score if isinstance(score, (int, float)) else None
         if score is not None and r["success"]:
-            by_day.setdefault(str(r["timestamp"])[:10], []).append(score)
+            by_day.setdefault(r["timestamp"][:10], []).append(score)
         if len(recent) < 10:
             recent.append({
                 "phone": r["user_phone"], "masked": _mask(r["user_phone"]),
@@ -1221,7 +1360,7 @@ def quiz_detail(start: str = None, end: str = None):
         rows = conn.execute(
             f'''SELECT user_phone, meta, timestamp FROM analytics_events
                 WHERE event_type = 'quiz_complete' AND {clause}
-                ORDER BY timestamp DESC''', params
+                ORDER BY timestamp DESC, id DESC''', params
         ).fetchall()
         started_by_user = {r["user_phone"]: r["c"] for r in conn.execute(
             f'''SELECT user_phone, COUNT(*) c FROM analytics_events
@@ -1229,14 +1368,14 @@ def quiz_detail(start: str = None, end: str = None):
         topic_started = {}
         for r in conn.execute(
             f'''SELECT meta FROM analytics_events WHERE event_type='quiz_start' AND {clause}''', params):
-            t = _parse_meta(r["meta"]).get("topic")
+            t = json.loads(r["meta"] or "{}").get("topic")
             if t:
                 topic_started[t] = topic_started.get(t, 0) + 1
 
     buckets = {"0-59": 0, "60-69": 0, "70-79": 0, "80-89": 0, "90-100": 0}
     topics, users, recent = {}, {}, []
     for r in rows:
-        m = _parse_meta(r["meta"])
+        m = json.loads(r["meta"] or "{}")
         s, t, topic = m.get("score"), m.get("total"), m.get("topic") or "General"
         if not (isinstance(s, (int, float)) and isinstance(t, (int, float)) and t > 0):
             continue
@@ -1306,7 +1445,7 @@ def opportunities_activity(start: str = None, end: str = None):
                WHERE (event_type='job_search'
                       OR (event_type='command' AND (lower(command) LIKE '/internship%' OR lower(command) LIKE '/competition%')))
                  AND {clause}
-               ORDER BY timestamp DESC LIMIT 10''', params
+               ORDER BY timestamp DESC, id DESC LIMIT 10''', params
         ).fetchall()
         topic_rows = conn.execute(
             f"SELECT meta FROM analytics_events WHERE event_type='job_search' AND {clause}", params
@@ -1321,7 +1460,7 @@ def opportunities_activity(start: str = None, end: str = None):
 
     topics = {}
     for r in topic_rows:
-        t = _parse_meta(r["meta"]).get("topic")
+        t = json.loads(r["meta"] or "{}").get("topic")
         if t:
             topics[t] = topics.get(t, 0) + 1
     top_topics = [{"topic": t, "count": c} for t, c in sorted(topics.items(), key=lambda x: -x[1])[:5]]
@@ -1333,7 +1472,7 @@ def opportunities_activity(start: str = None, end: str = None):
         fn = "/job_search" if is_job else ("/internships" if "internship" in (r["command"] or "").lower() else "/competitions")
         activity.append({
             "phone": r["user_phone"], "masked": _mask(r["user_phone"]), "function": fn,
-            "domain": _parse_meta(r["meta"]).get("topic") if is_job else None,
+            "domain": json.loads(r["meta"] or "{}").get("topic") if is_job else None,
             "tag": "Search" if is_job else "Browse", "time": r["timestamp"],
         })
     return {"functions": functions, "unique_users": users, "top_topics": top_topics, "recent": activity}
@@ -1382,8 +1521,8 @@ def _feature_of(event_type, command):
 
 def _feature_counts(conn, start, end):
     rows = conn.execute(
-        '''SELECT timestamp::date d, event_type, command FROM analytics_events
-           WHERE timestamp::date BETWEEN %s AND %s AND event_type IN
+        '''SELECT date(timestamp) d, event_type, command FROM analytics_events
+           WHERE date(timestamp) BETWEEN ? AND ? AND event_type IN
            ('command','job_search','quiz_start','ats_score','roadmap')''', (start, end)
     ).fetchall()
     total, by_day = {}, {}
@@ -1412,7 +1551,7 @@ def features_detail(start: str = None, end: str = None):
         recent_rows = conn.execute(
             '''SELECT event_type, command, success, timestamp FROM analytics_events
                WHERE event_type IN ('command','job_search','quiz_start','ats_score','roadmap')
-               ORDER BY timestamp DESC LIMIT 60'''
+               ORDER BY timestamp DESC, id DESC LIMIT 60'''
         ).fetchall()
 
     total = sum(cur.values())
@@ -1474,9 +1613,9 @@ def _ats_rows(conn, start, end):
     out = []
     for r in conn.execute(
         '''SELECT user_phone, meta, success, timestamp FROM analytics_events
-           WHERE event_type = 'ats_score' AND timestamp::date BETWEEN %s AND %s
-           ORDER BY timestamp DESC''', (start, end)):
-        m = _parse_meta(r["meta"])
+           WHERE event_type = 'ats_score' AND date(timestamp) BETWEEN ? AND ?
+           ORDER BY timestamp DESC, id DESC''', (start, end)):
+        m = json.loads(r["meta"] or "{}")
         sc = m.get("score")
         out.append({"phone": r["user_phone"], "meta": m, "success": bool(r["success"]), "time": r["timestamp"],
                     "score": sc if isinstance(sc, (int, float)) else None})
@@ -1589,7 +1728,7 @@ def resume_page(start: str = None, end: str = None):
 # ---------------------------------------------------------------
 def _user_label_map(conn):
     rows = conn.execute(
-        "SELECT user_phone FROM analytics_events GROUP BY user_phone ORDER BY MAX(timestamp) DESC"
+        "SELECT user_phone FROM analytics_events GROUP BY user_phone ORDER BY MAX(timestamp) DESC, user_phone"
     ).fetchall()
     return {r["user_phone"]: f"User {i}" for i, r in enumerate(rows, 1)}
 
@@ -1598,11 +1737,11 @@ def _quiz_period(conn, start, end, topic):
     rows = conn.execute(
         '''SELECT user_phone, event_type, meta, timestamp FROM analytics_events
            WHERE event_type IN ('quiz_start','quiz_complete','quiz_exit_early')
-             AND timestamp::date BETWEEN %s AND %s ORDER BY timestamp''', (start, end)
+             AND date(timestamp) BETWEEN ? AND ? ORDER BY timestamp, id''', (start, end)
     ).fetchall()
     starts, completes, exits = [], [], []
     for r in rows:
-        m = _parse_meta(r["meta"])
+        m = json.loads(r["meta"] or "{}")
         t = m.get("topic") or "General"
         if topic and t != topic:
             continue
@@ -1669,7 +1808,7 @@ def quiz_page(start: str = None, end: str = None, topic: str = None):
         prev = _quiz_period(conn, ps.isoformat(), pe.isoformat(), topic)
         opts = {}
         for r in conn.execute("SELECT meta FROM analytics_events WHERE event_type IN ('quiz_start','quiz_complete')"):
-            m = _parse_meta(r["meta"])
+            m = json.loads(r["meta"] or "{}")
             t = m.get("topic") or "General"
             if isinstance(m.get("total"), (int, float)):
                 opts[t] = int(m["total"])
@@ -1796,11 +1935,11 @@ def _opp_counts(conn, start, end):
              SUM(CASE WHEN event_type='job_search' THEN 1 ELSE 0 END) jobs,
              SUM(CASE WHEN event_type='command' AND lower(command) LIKE '%internship%' THEN 1 ELSE 0 END) interns,
              SUM(CASE WHEN event_type='command' AND lower(command) LIKE '%competition%' THEN 1 ELSE 0 END) comps
-           FROM analytics_events WHERE timestamp::date BETWEEN %s AND %s''', (start, end)).fetchone()
+           FROM analytics_events WHERE date(timestamp) BETWEEN ? AND ?''', (start, end)).fetchone()
     users = conn.execute(
         '''SELECT COUNT(DISTINCT user_phone) c FROM analytics_events
            WHERE (event_type='job_search' OR (event_type='command' AND (lower(command) LIKE '%internship%' OR lower(command) LIKE '%competition%')))
-             AND timestamp::date BETWEEN %s AND %s''', (start, end)).fetchone()["c"]
+             AND date(timestamp) BETWEEN ? AND ?''', (start, end)).fetchone()["c"]
     return {"jobs": r["jobs"] or 0, "interns": r["interns"] or 0, "comps": r["comps"] or 0, "users": users}
 
 
@@ -1824,7 +1963,7 @@ def opportunities_page(start: str = None, end: str = None):
         rows = conn.execute(
             '''SELECT user_phone, event_type, command, meta, timestamp FROM analytics_events
                WHERE (event_type='job_search' OR (event_type='command' AND (lower(command) LIKE '%internship%' OR lower(command) LIKE '%competition%')))
-                 AND timestamp::date BETWEEN %s AND %s ORDER BY timestamp DESC''', (start, end)).fetchall()
+                 AND date(timestamp) BETWEEN ? AND ? ORDER BY timestamp DESC, id DESC''', (start, end)).fetchall()
 
     total = (cur["jobs"] + cur["interns"] + cur["comps"]) or 1
     def fn(key, label, c, p):
@@ -1836,7 +1975,7 @@ def opportunities_page(start: str = None, end: str = None):
 
     job_t, int_t, comps, recent = {}, {}, [], []
     for r in rows:
-        m = _parse_meta(r["meta"])
+        m = json.loads(r["meta"] or "{}")
         cmd = (r["command"] or "").lower()
         if r["event_type"] == "job_search":
             kind, dom = "job_search", _domain_of(m)
