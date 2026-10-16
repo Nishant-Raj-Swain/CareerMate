@@ -11,7 +11,6 @@
 #    usage, resume/ATS, job search, quiz, performance, AI usage, errors,
 #    funnel).
 
-import sqlite3
 from fastapi import APIRouter, HTTPException, Header, Request, Depends
 from pydantic import BaseModel, Field
 
@@ -269,22 +268,13 @@ async def post_settings(patch: SettingsPatch, _: str = Depends(require_admin)):
 async def get_analytics_logs(limit: int = 200, _: str = Depends(require_admin)):
     """Returns the raw user_logs rows (one row per command sent)."""
     try:
-        conn = sqlite3.connect(analytics.DB_NAME)
-        conn.row_factory = sqlite3.Row
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS user_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                whatsapp_no TEXT NOT NULL,
-                command TEXT NOT NULL,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        ''')
-        rows = cursor.execute(
-            "SELECT whatsapp_no, command, timestamp FROM user_logs ORDER BY timestamp DESC LIMIT ?",
-            (limit,)
-        ).fetchall()
-        conn.close()
+        with analytics._conn() as conn:
+            rows = conn.raw(
+                """SELECT user_phone AS whatsapp_no, command,
+                          to_char(timestamp AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS timestamp
+                   FROM analytics_events WHERE event_type = 'command' AND user_phone IS NOT NULL
+                   ORDER BY timestamp DESC, id DESC LIMIT %s""", (limit,)
+            ).fetchall()
         return [dict(row) for row in rows]
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
