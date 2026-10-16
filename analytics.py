@@ -100,7 +100,7 @@ def init_analytics_db():
         conn.execute('CREATE INDEX IF NOT EXISTS idx_events_phone ON analytics_events(user_phone)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_events_type ON analytics_events(event_type)')
         conn.execute('CREATE INDEX IF NOT EXISTS idx_events_ts ON analytics_events(timestamp)')
-        conn.commit()
+        #conn.commit()
 
 
 def log_event(phone: str, event_type: str, command: str = None, meta: dict = None,
@@ -115,7 +115,7 @@ def log_event(phone: str, event_type: str, command: str = None, meta: dict = Non
                    VALUES (%s, %s, %s, %s::jsonb, %s, %s)''',
                 (phone, event_type, command, json.dumps(meta or {}), 1 if success else 0, response_time_ms)
             )
-            conn.commit()
+            #conn.commit()
     except Exception:
         pass
 
