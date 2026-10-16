@@ -6,6 +6,7 @@ import logging
 import os
 import sqlite3
 import sys
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
@@ -16,7 +17,9 @@ from fastapi.responses import Response
 from langchain_core.messages import HumanMessage
 from langgraph.checkpoint.memory import MemorySaver
 
-from auth import init_auth_db, verify_webhook_signature  # Import auth initializer
+from auth import init_auth_db  # Import auth initializer
+import settings_store  # NEW: admin-panel preference storage
+import analytics  # NEW: rich event logging for the admin dashboard
 
 # Load environment variables relative to main.py location
 env_path = Path(__file__).resolve().parent / ".env"
@@ -54,20 +57,27 @@ locks = {}
 langgraph_app = None
 
 
-def log_user_command(whatsapp_no: str, command: str, event_details: str = None):
-    """Logs user interactions to persistent DB for analytics dashboard tracking."""
+def log_user_command(whatsapp_no: str, command: str):
+    """Legacy raw-log table — kept as-is so any existing tooling reading
+    user_logs keeps working. The richer analytics_events table (written
+    via analytics.log_event) is what the admin dashboard actually reads."""
     try:
-        event_type = "command" if command.startswith("/") else "message"
-        cmd_name = command.split()[0] if command.startswith("/") else None
-        
-        db.log_analytics_event(
-            user_phone=whatsapp_no,
-            event_type=event_type,
-            command=cmd_name,
-            success=True,
-            response_time=0.0,
-            event_details=event_details
-        )
+        conn = sqlite3.connect("bot_analytics.db")
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                whatsapp_no TEXT NOT NULL,
+                command TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        cursor.execute('''
+            INSERT INTO user_logs (whatsapp_no, command, timestamp)
+            VALUES (?, ?, ?)
+        ''', (whatsapp_no, command.strip(), datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+        conn.commit()
+        conn.close()
     except Exception as e:
         logger.error(f"Failed to log command to analytics DB: {e}")
 
@@ -75,10 +85,11 @@ def log_user_command(whatsapp_no: str, command: str, event_details: str = None):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global wa, ai_service, news_service, langgraph_app
-    
-    db.initialize()  # Creates PostgreSQL tables in Supabase automatically
-    init_auth_db()   # Initializes auth tables
-    
+
+    db.initialize()
+    init_auth_db()  # Initialized auth tables on app startup
+    analytics.init_analytics_db()  # NEW: creates analytics_events if missing
+    settings_store.init_settings_db()  # NEW: creates admin_settings if missing
     wa = WhatsApp()
     ai_service = AIService()
     news_service = NewsService(wa_access_token=WHATSAPP_TOKEN, wa_phone_id=PHONE_NUMBER_ID)
@@ -87,7 +98,7 @@ async def lifespan(app: FastAPI):
         logger.error("❌ WHATSAPP_TOKEN is missing or empty in environment! Outgoing messages will fail.")
     else:
         logger.info(f"✅ WHATSAPP_TOKEN loaded successfully! (Length: {len(WHATSAPP_TOKEN)})")
-        
+
     if not PHONE_NUMBER_ID:
         logger.error("❌ PHONE_NUMBER_ID is missing or empty in environment! API requests will fail.")
     else:
@@ -110,26 +121,20 @@ async def send_next_question(phone: str, state: dict):
     """Formats and sends the current quiz question."""
     idx = state.get("current_index", 0)
     questions = state.get("questions", [])
-    
+
     if idx >= len(questions):
         score = state.get("score", 0)
         total = len(questions)
         topic = state.get("topic", "Quiz").title()
-        
-        # Log completed quiz to database with attempted count
-        try:
-            db.log_quiz_result(
-                user_phone=phone, 
-                topic=topic, 
-                score=score, 
-                attempted=total, 
-                completed=True
-            )
-        except Exception as e:
-            logger.error(f"Failed to log completed quiz analytics: {e}")
-        
+
+        # NEW: quiz completion event for the admin dashboard's quiz analytics
+        analytics.log_event(
+            phone, "quiz_complete",
+            meta={"topic": state.get("topic", "quiz"), "score": score, "total": total}
+        )
+
         await wa.text(
-            phone, 
+            phone,
             f"🎉 *{topic} Quiz Completed!*\n\n"
             f"📊 *Final Score:* {score} / {total}\n"
             f"Percentage: {(score/total)*100:.1f}%\n\n"
@@ -153,15 +158,16 @@ async def send_next_question(phone: str, state: dict):
         f"_Reply with A, B, C, or D (or send *exit* to quit early)_"
     )
     await wa.text(phone, msg)
-    
+
 
 async def handle_roadmap_generation(phone: str, topic: str):
     """Generates an official PDF roadmap or falls back to an AI visual roadmap card."""
     await wa.text(phone, f"🔍 Searching roadmap.sh for official *{topic.title()}* PDF...")
-    
+
     pdf_sent = await wa.send_roadmap_pdf(to=phone, topic_name=topic)
 
     if pdf_sent:
+        analytics.log_event(phone, "roadmap", meta={"topic": topic, "source": "official_pdf"})
         db.save_state(phone, {})
         await wa.menu(phone)
         return
@@ -169,16 +175,16 @@ async def handle_roadmap_generation(phone: str, topic: str):
     await wa.text(phone, "Official PDF not found on roadmap.sh. Generating custom AI visual roadmap...")
     roadmap_data = await ai_service.generate_structured_roadmap(topic)
     image_bytes = image_service.generate_roadmap_card(topic, roadmap_data.get("sections", {}))
-    
+
     media_id = await wa.upload_media(image_bytes, "image/jpeg", "roadmap.jpg")
     await wa.send_image_by_id(phone, media_id, caption=f"🗺️ {topic.title()} Roadmap")
+    analytics.log_event(phone, "roadmap", meta={"topic": topic, "source": "ai_generated"})
     db.save_state(phone, {})
-    
+
     if roadmap_data.get("summary"):
         await wa.text(phone, roadmap_data.get("summary", ""))
-        
+
     await wa.menu(phone)
-    
 
 
 async def handle_text(phone: str, text: str):
@@ -189,19 +195,17 @@ async def handle_text(phone: str, text: str):
     # --- QUIZ INTERACTION MODE ---
     if mode == "quiz":
         ans = text.strip().lower()
-        
+
         if ans in ("exit", "quit", "stop", "cancel", "/cancel", "/exit"):
             score = state.get("score", 0)
             attempted = state.get("current_index", 0)
             topic = state.get("topic", "Quiz").title()
-            
-            # Log early exit to quiz_analytics
-            try:
-                db.log_quiz_result(user_phone=phone, topic=topic, score=score, attempted=attempted, completed=False)
-            except Exception as e:
-                logger.error(f"Failed to log early quiz exit analytics: {e}")
 
-        
+            analytics.log_event(
+                phone, "quiz_exit_early",
+                meta={"topic": state.get("topic", "quiz"), "score": score, "attempted": attempted}
+            )
+
             await wa.text(
                 phone,
                 f"🛑 *Test Ended Early*\n\n"
@@ -215,7 +219,7 @@ async def handle_text(phone: str, text: str):
 
         ans_upper = text.strip().upper()
         mapping = {"A": 0, "B": 1, "C": 2, "D": 3}
-        
+
         if ans_upper not in mapping:
             await wa.text(phone, "⚠️ Please reply with option **A**, **B**, **C**, **D**, or send **exit** to quit the test.")
             return
@@ -243,20 +247,15 @@ async def handle_text(phone: str, text: str):
     # --- ATS SCORE MODE ---
     if mode == "ats_score":
         db.save_resume(phone, text)
+        analytics.log_event(phone, "resume_upload", meta={"source": "text", "mode": "ats_score"})
         target_role = state.get("target_role", "Data Analyst / Software Role")
         await wa.text(phone, f"🎯 Evaluating resume for target role: *{target_role}*...")
-        
-        score_report = await ai_service.score_resume_ats(resume_text=text, target_role=target_role)
-        
-        # Extract numeric ATS score and save to resume_analytics
-        try:
-            import re
-            match = re.search(r'(\d{1,3})\s*%', score_report)
-            ats_val = int(match.group(1)) if match else None
-            db.log_resume_analytics(user_phone=phone, ats_score=ats_val, analysis_type="ats_score")
-        except Exception as e:
-            logger.error(f"Failed to log ATS resume analytics: {e}")
 
+        score_report = await ai_service.score_resume_ats(resume_text=text, target_role=target_role)
+        analytics.log_event(
+            phone, "ats_score",
+            meta={"target_role": target_role, "score": analytics.extract_score(score_report)}
+        )
         db.save_state(phone, {})
         await wa.text(phone, score_report)
         await wa.menu(phone)
@@ -264,39 +263,22 @@ async def handle_text(phone: str, text: str):
 
     if mode == "resume":
         db.save_resume(phone, text)
+        analytics.log_event(phone, "resume_upload", meta={"source": "text", "mode": "resume"})
         await wa.text(phone, "Resume saved. Generating review...")
         review = await ai_service.analyze_resume(text)
-        
-        try:
-            db.log_resume_analytics(user_phone=phone, ats_score=None, analysis_type="review")
-        except Exception as e:
-            logger.error(f"Failed to log resume review analytics: {e}")
-
         db.save_state(phone, {})
         await wa.text(phone, review)
         await wa.menu(phone)
         return
-        
 
     if mode == "job_search":
-        search_query = text.strip()
-        
-        # Log the search topic directly to analytics_events
-        db.log_analytics_event(
-            user_phone=phone,
-            event_type="command",
-            command="/job_search",
-            event_details=search_query
-        )
-        
-        await wa.text(phone, f"🔍 Searching for recent *{search_query}* job postings...")
-        job_results = await ai_service.search_jobs(search_query)
-        
+        await wa.text(phone, f"🔍 Searching for recent *{text}* job postings...")
+        job_results = await ai_service.search_jobs(text)
+        analytics.log_event(phone, "job_search", meta={"topic": text})
         db.save_state(phone, {})
         await wa.text(phone, job_results)
         await wa.menu(phone)
         return
-       
 
     if mode == "roadmap":
         await handle_roadmap_generation(phone, text)
@@ -305,13 +287,13 @@ async def handle_text(phone: str, text: str):
     if mode == "assistance":
         config = {"configurable": {"thread_id": phone}}
         input_msg = f"User Resume:\n{user['resume']}\n\nQuestion:\n{text}" if user.get("resume") else text
-        
+
         output = await asyncio.to_thread(
-            langgraph_app.invoke, 
-            {"messages": [HumanMessage(content=input_msg)]}, 
+            langgraph_app.invoke,
+            {"messages": [HumanMessage(content=input_msg)]},
             config
         )
-        
+
         if isinstance(output, dict) and "messages" in output and len(output["messages"]) > 0:
             last_msg = output["messages"][-1]
             text_content = last_msg.content if hasattr(last_msg, 'content') else str(last_msg)
@@ -319,10 +301,11 @@ async def handle_text(phone: str, text: str):
             text_content = output.content
         else:
             text_content = str(output)
-            
+
         if len(text_content) > 4000:
             text_content = text_content[:3990] + "\n\n*(Message truncated due to length)*"
-            
+
+        analytics.log_event(phone, "ai_assistance", meta={"reply_chars": len(text_content)})
         await wa.text(phone, text_content)
         return
 
@@ -330,16 +313,15 @@ async def handle_text(phone: str, text: str):
     await wa.menu(phone)
 
 
-
 async def command(phone: str, text: str):
     parts = text.split(maxsplit=1)
     cmd = parts[0].lower()
-    
+
     if cmd in ("/start", "/help", "/menu", "/cancel"):
         db.save_state(phone, {})
         await wa.menu(phone)
         return
-        
+
     if cmd == "/delete":
         db.delete_user(phone)
         await wa.text(phone, "Local user session deleted.")
@@ -377,6 +359,10 @@ async def command(phone: str, text: str):
         if existing_resume:
             await wa.text(phone, f"🎯 Scoring existing resume against: *{target_role}*...")
             score_report = await ai_service.score_resume_ats(resume_text=existing_resume, target_role=target_role)
+            analytics.log_event(
+                phone, "ats_score",
+                meta={"target_role": target_role, "score": analytics.extract_score(score_report)}
+            )
             db.save_state(phone, {})
             await wa.text(phone, score_report)
             await wa.menu(phone)
@@ -393,16 +379,21 @@ async def command(phone: str, text: str):
     if cmd == "/prepare":
         topic = parts[1].strip().lower() if len(parts) > 1 else "python"
         await wa.text(phone, f"⏳ Generating 20 practice questions for *{topic.title()}* from IndiaBIX...")
-        
+
         questions = await quiz_service.fetch_indiabix_questions(topic=topic, total_needed=20)
-        
+
         if not questions:
+            analytics.log_event(phone, "error", command="/prepare",
+                                 meta={"stage": "quiz_fetch", "message": f"No questions for topic '{topic}'"},
+                                 success=False)
             await wa.text(
-                phone, 
+                phone,
                 "❌ Couldn't load questions for this topic right now.\n"
                 "Try topics like `/prepare aptitude`, `/prepare reasoning`, `/prepare python`, `/prepare java`, or `/prepare sql`."
             )
             return
+
+        analytics.log_event(phone, "quiz_start", meta={"topic": topic, "count": len(questions)})
 
         quiz_state = {
             "mode": "quiz",
@@ -419,23 +410,15 @@ async def command(phone: str, text: str):
         if len(parts) > 1:
             domain_query = parts[1].strip()
             db.save_state(phone, {})
-            
-            db.log_analytics_event(
-                user_phone=phone,
-                event_type="command",
-                command="/job_search",
-                event_details=domain_query
-            )
-            
             await wa.text(phone, f"🔍 Searching for recent *{domain_query}* job postings...")
             job_results = await ai_service.search_jobs(domain_query)
+            analytics.log_event(phone, "job_search", meta={"topic": domain_query})
             await wa.text(phone, job_results)
             await wa.menu(phone)
         else:
             db.save_state(phone, {"mode": "job_search"})
             await wa.text(phone, "🔍 *Job Search Mode*\n\nPlease reply with the role or domain you are searching for (e.g., Data Analyst, Python Developer).")
         return
-
 
     if cmd == "/roadmap":
         if len(parts) > 1:
@@ -453,7 +436,7 @@ async def command(phone: str, text: str):
             mode = "resume"
 
         db.save_state(phone, {"mode": mode})
-        
+
         prompts = {
             "resume": "Upload PDF/DOCX resume or paste text.",
             "assistance": "Ask any career question."
@@ -464,9 +447,9 @@ async def command(phone: str, text: str):
 async def process_message(message: dict):
     phone = message.get("from", "")
     msg_id = message.get("id", "")
-    
+
     logger.info(f"Processing incoming message [{msg_id}] from user: {phone}")
-    
+
     # Check duplicate processing via DB claim check
     if not db.claim_message(msg_id):
         logger.info(f"Message ID [{msg_id}] already processed. Skipping duplicate.")
@@ -481,7 +464,7 @@ async def process_message(message: dict):
             mode = state.get("mode")
             doc = message["document"]
             content = await wa.download(doc["id"])
-            
+
             try:
                 extracted = pdf_service.extract_text(doc.get("filename", "file.pdf"), content)
                 if not extracted or len(extracted.strip()) == 0:
@@ -489,6 +472,11 @@ async def process_message(message: dict):
 
             except Exception as e:
                 logger.error(f"Failed to extract document text for {phone}: {e}")
+                analytics.log_event(
+                    phone, "error",
+                    meta={"stage": "pdf_extraction", "message": str(e)},
+                    success=False
+                )
                 await wa.text(
                     phone,
                     "❌ *Could not read text from this document.*\n\n"
@@ -498,17 +486,23 @@ async def process_message(message: dict):
 
             if mode == "ats_score":
                 db.save_resume(phone, extracted)
+                analytics.log_event(phone, "resume_upload", meta={"source": "document", "mode": "ats_score"})
                 target_role = state.get("target_role", "Data Analyst / Software Role")
                 await wa.text(phone, f"🎯 Document uploaded. Evaluating ATS score for *{target_role}*...")
-                
+
                 score_report = await ai_service.score_resume_ats(resume_text=extracted, target_role=target_role)
+                analytics.log_event(
+                    phone, "ats_score",
+                    meta={"target_role": target_role, "score": analytics.extract_score(score_report)}
+                )
                 db.save_state(phone, {})
                 await wa.text(phone, score_report)
                 await wa.menu(phone)
             else:
                 db.save_resume(phone, extracted)
+                analytics.log_event(phone, "resume_upload", meta={"source": "document", "mode": mode or "resume"})
                 await wa.text(phone, "✅ Resume saved successfully. Generating review...")
-                
+
                 review = await ai_service.analyze_resume(extracted)
                 db.save_state(phone, {})
                 await wa.text(phone, review)
@@ -518,12 +512,35 @@ async def process_message(message: dict):
         # Text handling with default fallback
         text = (message.get("text", {}) or {}).get("body", "").strip()
         if text:
-            log_user_command(whatsapp_no=phone, command=text)  # Logging execution details
+            log_user_command(whatsapp_no=phone, command=text)  # legacy raw-log table
 
-        if text.startswith("/"):
-            await command(phone, text)
-        elif text:
-            await handle_text(phone, text)
+        if text:
+            start_ts = time.perf_counter()
+            ok = True
+            try:
+                if text.startswith("/"):
+                    await command(phone, text)
+                else:
+                    await handle_text(phone, text)
+            except Exception as e:
+                ok = False
+                logger.error(f"Error handling message from {phone}: {e}")
+                analytics.log_event(
+                    phone, "error", command=text,
+                    meta={"stage": "dispatch", "message": str(e)},
+                    success=False
+                )
+                try:
+                    await wa.text(phone, "⚠️ Something went wrong processing that. Please try again.")
+                except Exception:
+                    pass
+            finally:
+                elapsed_ms = int((time.perf_counter() - start_ts) * 1000)
+                logged_command = text.split()[0].lower() if text.startswith("/") else "message"
+                analytics.log_event(
+                    phone, "command", command=logged_command,
+                    success=ok, response_time_ms=elapsed_ms
+                )
 
 
 @app.get("/webhook")
@@ -552,14 +569,15 @@ async def webhook(request: Request, bg_tasks: BackgroundTasks):
             raise HTTPException(status_code=413)
 
     sig = request.headers.get("x-hub-signature-256", "")
-    
+
     if APP_SECRET:
-        if not verify_webhook_signature(bytes(buffer), sig, APP_SECRET):
+        expected = "sha256=" + hmac.new(APP_SECRET.encode(), bytes(buffer), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
             logger.warning("Invalid webhook signature from Meta.")
-            raise HTTPException(status_code=403, detail="Invalid webhook signature")
+            raise HTTPException(status_code=403)
 
     payload = json.loads(bytes(buffer))
-    
+
     # Process valid WhatsApp entry changes
     for entry in payload.get("entry", []):
         for change in entry.get("changes", []):
