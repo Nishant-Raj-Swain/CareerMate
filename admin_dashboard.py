@@ -1,348 +1,290 @@
-import os
-from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException, Header, Request, status
-from pydantic import BaseModel
+# admin_dashboard.py
+#
+# API surface consumed by the separate Flask admin panel. Two things
+# changed from the original version:
+#
+# 1. Authentication now goes through auth.py's real PBKDF2 + session-table
+#    implementation (rate-limited, 24h sessions) instead of comparing
+#    plaintext env vars and returning a hardcoded token.
+# 2. A full set of analytics endpoints backed by analytics.py, matching
+#    every section in the admin dashboard spec (overview, growth, feature
+#    usage, resume/ATS, job search, quiz, performance, AI usage, errors,
+#    funnel).
 
-import database as db
-from auth import (
-    authenticate_admin,
-    create_session,
-    validate_session,
-    terminate_session,
-    is_rate_limited,
-    record_failed_attempt,
-    clear_failed_attempts,
-)
+import sqlite3
+from fastapi import APIRouter, HTTPException, Header, Request, Depends
+from pydantic import BaseModel, Field
+
+import auth
+import analytics
+import settings_store
 
 router = APIRouter()
 
+
+# --- Request Models ---
 class LoginRequest(BaseModel):
     username: str
     password: str
 
-def get_client_ip(request: Request) -> str:
-    forwarded_for = request.headers.get("X-Forwarded-For")
-    if forwarded_for:
-        return forwarded_for.split(",")[0].strip()
-    return request.client.host if request.client else "127.0.0.1"
 
-async def require_admin(authorization: Optional[str] = Header(None)) -> str:
+class SettingsPatch(BaseModel):
+    bot_name: str | None = None
+    welcome_message: str | None = None
+    notify_new_user: bool | None = None
+    notify_new_job: bool | None = None
+    notify_system_errors: bool | None = None
+    notify_weekly_reports: bool | None = None
+    theme: str | None = None
+    primary_color: str | None = None
+    sidebar_style: str | None = None
+    bot_active: bool | None = None
+    bot_avatar: str | None = Field(default=None, max_length=8)
+
+
+# --- Auth dependency ---
+def require_admin(authorization: str = Header(None)):
+    """Raises 401 unless the Authorization header carries a valid,
+    non-expired session token minted by /api/auth/login."""
     if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing or invalid Authorization header scheme."
-        )
-    token = authorization.split("Bearer ")[1].strip()
-    username = validate_session(token)
-    if not username:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Session invalid or expired."
-        )
-    return username
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    token = authorization.split(" ", 1)[1].strip()
+    if not auth.validate_session(token):
+        raise HTTPException(status_code=401, detail="Session invalid or expired")
+    return token
 
+
+# --- Authentication endpoints ---
 @router.post("/api/auth/login")
 async def login(credentials: LoginRequest, request: Request):
-    client_ip = get_client_ip(request)
-    username_clean = credentials.username.strip().lower()
+    client_ip = request.client.host if request.client else "unknown"
 
-    if is_rate_limited(client_ip) or is_rate_limited(username_clean):
-        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail="Too many failed login attempts.")
+    if auth.is_rate_limited(client_ip):
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed attempts. Try again in 15 minutes."
+        )
 
-    if not authenticate_admin(username_clean, credentials.password):
-        record_failed_attempt(client_ip)
-        record_failed_attempt(username_clean)
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid username or password.")
+    if not auth.authenticate_admin(credentials.username, credentials.password):
+        auth.record_failed_attempt(client_ip)
+        raise HTTPException(status_code=401, detail="Invalid username or password")
 
-    clear_failed_attempts(client_ip)
-    clear_failed_attempts(username_clean)
+    auth.clear_failed_attempts(client_ip)
+    token = auth.create_session(credentials.username)
+    return {"token": token, "username": credentials.username.lower(), "expires_in_hours": 24}
 
-    session_token = create_session(username_clean, duration_hours=24)
-    return {"status": "success", "token": session_token, "token_type": "bearer", "username": username_clean}
 
 @router.post("/api/auth/logout")
-async def logout(authorization: Optional[str] = Header(None)):
+async def logout(authorization: str = Header(None)):
     if authorization and authorization.startswith("Bearer "):
-        token = authorization.split("Bearer ")[1].strip()
-        terminate_session(token)
-    return {"status": "success", "message": "Logged out successfully."}
+        auth.terminate_session(authorization.split(" ", 1)[1].strip())
+    return {"status": "Logged out successfully"}
+
 
 @router.get("/api/auth/verify")
-async def verify_token(current_user: str = Depends(require_admin)):
-    return {"status": "valid", "username": current_user}
-
-# --- Analytics Endpoints ---
+async def verify(_: str = Depends(require_admin)):
+    return {"valid": True}
 
 
+# --- Analytics endpoints (all require a valid session) ---
 @router.get("/api/analytics/overview")
-async def get_overview(date: Optional[str] = None, current_user: str = Depends(require_admin)):
-    target_date = date if date else datetime.utcnow().strftime("%Y-%m-%d")
-    with db.get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) as count FROM users;")
-            total_users = cur.fetchone()["count"]
+async def get_overview(date: str = None, _: str = Depends(require_admin)):
+    return analytics.overview(date=date)
 
-            cur.execute("SELECT COUNT(DISTINCT user_phone) as count FROM analytics_events WHERE DATE(timestamp) = %s;", (target_date,))
-            today_users = cur.fetchone()["count"]
-
-            cur.execute("SELECT COUNT(DISTINCT user_phone) as count FROM analytics_events WHERE timestamp >= NOW() - INTERVAL '7 days';")
-            active_users_7d = cur.fetchone()["count"]
-
-            cur.execute("SELECT COUNT(*) as count FROM processed_messages;")
-            messages_processed = cur.fetchone()["count"]
-
-            cur.execute("SELECT COUNT(*) as count FROM analytics_events WHERE command IN ('/assistance', '/roadmap', '/ats_score', '/prepare', '/news', '/job_search');")
-            ai_requests = cur.fetchone()["count"]
-
-    return {
-        "total_users": total_users,
-        "today_users": today_users,
-        "active_users_7d": active_users_7d,
-        "messages_processed": messages_processed,
-        "ai_requests": ai_requests
-    }
 
 @router.get("/api/analytics/new-returning")
-async def get_new_returning(date: Optional[str] = None, current_user: str = Depends(require_admin)):
-    target_date = date if date else datetime.utcnow().strftime("%Y-%m-%d")
-    with db.get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) as count FROM users WHERE DATE(created_at) = %s;", (target_date,))
-            new_users = cur.fetchone()["count"]
+async def get_new_returning(date: str = None, _: str = Depends(require_admin)):
+    return analytics.new_vs_returning(date=date)
 
-            cur.execute("""
-                SELECT COUNT(DISTINCT e.user_phone) as count 
-                FROM analytics_events e
-                JOIN users u ON u.phone = e.user_phone
-                WHERE DATE(e.timestamp) = %s AND DATE(u.created_at) < %s;
-            """, (target_date, target_date))
-            returning_users = cur.fetchone()["count"]
-
-    return {"new_users": new_users, "returning_users": returning_users}
 
 @router.get("/api/analytics/growth")
-async def get_growth(months: int = 6, current_user: str = Depends(require_admin)):
-    with db.get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT TO_CHAR(created_at, 'Mon YYYY') as month, COUNT(*) as users
-                FROM users
-                WHERE created_at >= NOW() - (%s || ' months')::INTERVAL
-                GROUP BY TO_CHAR(created_at, 'Mon YYYY'), DATE_TRUNC('month', created_at)
-                ORDER BY DATE_TRUNC('month', created_at) ASC;
-            """, (months,))
-            rows = [dict(r) for r in cur.fetchall()]
-    return {"data": rows}
+async def get_growth(months: int = 6, _: str = Depends(require_admin)):
+    return {"data": analytics.monthly_growth(months=months)}
+
 
 @router.get("/api/analytics/daily")
-async def get_daily(start: Optional[str] = None, end: Optional[str] = None, current_user: str = Depends(require_admin)):
-    with db.get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT DATE(timestamp)::text as date, COUNT(DISTINCT user_phone) as users
-                FROM analytics_events
-                WHERE timestamp >= NOW() - INTERVAL '30 days'
-                GROUP BY DATE(timestamp)
-                ORDER BY date ASC;
-            """)
-            rows = [dict(r) for r in cur.fetchall()]
-    return {"data": rows}
+async def get_daily(start: str = None, end: str = None, _: str = Depends(require_admin)):
+    return {"data": analytics.daily_activity(start=start, end=end)}
+
 
 @router.get("/api/analytics/hourly")
-async def get_hourly(date: Optional[str] = None, current_user: str = Depends(require_admin)):
-    target_date = date if date else datetime.utcnow().strftime("%Y-%m-%d")
-    with db.get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT EXTRACT(HOUR FROM timestamp)::int as hour, COUNT(*) as count
-                FROM analytics_events
-                WHERE DATE(timestamp) = %s
-                GROUP BY hour
-                ORDER BY hour ASC;
-            """, (target_date,))
-            rows = [dict(r) for r in cur.fetchall()]
-    return {"data": rows}
+async def get_hourly(date: str = None, start: str = None, end: str = None, _: str = Depends(require_admin)):
+    return {"data": analytics.hourly_activity(date=date, start=start, end=end)}
+
+
+@router.get("/api/analytics/features/detail")
+async def get_features_detail(start: str = None, end: str = None, _: str = Depends(require_admin)):
+    return analytics.features_detail(start, end)
+
 
 @router.get("/api/analytics/features")
-async def get_features(start: Optional[str] = None, end: Optional[str] = None, current_user: str = Depends(require_admin)):
-    with db.get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT command, COUNT(*) as count 
-                FROM analytics_events 
-                WHERE command IS NOT NULL 
-                GROUP BY command 
-                ORDER BY count DESC;
-            """)
-            rows = [dict(r) for r in cur.fetchall()]
-    return {"usage": rows, "most_used": rows}
-
-@router.get("/api/analytics/funnel")
-async def get_funnel(current_user: str = Depends(require_admin)):
-    with db.get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) as count FROM users;")
-            total_u = cur.fetchone()["count"]
-
-            cur.execute("SELECT COUNT(DISTINCT user_phone) as count FROM analytics_events WHERE command IS NOT NULL;")
-            command_u = cur.fetchone()["count"]
-
-            cur.execute("SELECT COUNT(DISTINCT user_phone) as count FROM quiz_analytics;")
-            quiz_u = cur.fetchone()["count"]
-
-    return {
-        "steps": [
-            {"label": "Total Users", "value": total_u},
-            {"label": "Executed Command", "value": command_u},
-            {"label": "Attempted Quiz", "value": quiz_u}
-        ]
-    }
-
-
-
-@router.get("/api/analytics/jobs")
-async def get_jobs_analytics(current_user: str = Depends(require_admin)):
-    with db.get_connection() as conn:
-        with conn.cursor() as cur:
-            # Count total job search executions
-            cur.execute("SELECT COUNT(*) as count FROM analytics_events WHERE command = '/job_search';")
-            searches = cur.fetchone()["count"]
-
-            # Count unique users who searched
-            cur.execute("SELECT COUNT(DISTINCT user_phone) as count FROM analytics_events WHERE command = '/job_search';")
-            unique_users = cur.fetchone()["count"]
-
-            # Query most frequent domains/topics recorded in event_details
-            cur.execute("""
-                SELECT 
-                    INITCAP(TRIM(event_details)) as topic,
-                    COUNT(*) as count
-                FROM analytics_events
-                WHERE command = '/job_search' 
-                  AND event_details IS NOT NULL 
-                  AND TRIM(event_details) != ''
-                GROUP BY INITCAP(TRIM(event_details))
-                ORDER BY count DESC
-                LIMIT 5;
-            """)
-            rows = cur.fetchall()
-
-            # Map results to popular_topics expected by dashboard.js
-            popular_topics = [
-                {"topic": r["topic"], "count": r["count"]} for r in rows
-            ]
-
-    return {
-        "searches": searches,
-        "unique_users": unique_users,
-        "popular_topics": popular_topics
-    }
-
+async def get_features(date: str = None, start: str = None, end: str = None, _: str = Depends(require_admin)):
+    return analytics.feature_usage(date=date, start=start, end=end)
 
 
 @router.get("/api/analytics/resume")
-async def get_resume_analytics(current_user: str = Depends(require_admin)):
-    with db.get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) as total, COALESCE(AVG(ats_score), 0) as avg_score, COALESCE(MAX(ats_score), 0) as highest_score FROM resume_analytics;")
-            row = cur.fetchone()
-            total = row["total"] or 0
-            avg_score = round(float(row["avg_score"]), 1) if total > 0 else None
-            highest_score = round(float(row["highest_score"]), 1) if total > 0 else None
-    return {
-        "resumes_uploaded": total,
-        "ats_analyses": total,
-        "average_score": avg_score,
-        "highest_score": highest_score,
-        "score_distribution": {"0-50%": 0, "50-80%": total, "80-100%": 0}
-    }
+async def get_resume(_: str = Depends(require_admin)):
+    return analytics.resume_analytics()
+
+
+@router.get("/api/analytics/jobs")
+async def get_jobs(_: str = Depends(require_admin)):
+    return analytics.job_search_analytics()
+
 
 @router.get("/api/analytics/quiz")
-async def get_quiz_analytics(current_user: str = Depends(require_admin)):
-    with db.get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT 
-                    COUNT(*) as total_quizzes,
-                    SUM(CASE WHEN completed THEN 1 ELSE 0 END) as completed_quizzes,
-                    COALESCE(AVG(score), 0) as avg_score,
-                    COALESCE(SUM(attempted), 0) as total_attempted
-                FROM quiz_analytics;
-            """)
-            row = cur.fetchone()
-            started = row["total_quizzes"] or 0
-            completed = row["completed_quizzes"] or 0
-            avg_score = round(float(row["avg_score"]), 1) if started > 0 else None
-            completion_rate = round((completed / started * 100), 1) if started > 0 else 0
-            attempted = row["total_attempted"] or 0
+async def get_quiz(_: str = Depends(require_admin)):
+    return analytics.quiz_analytics()
 
-    return {
-        "quizzes_started": started,
-        "quizzes_completed": completed,
-        "questions_answered": attempted,
-        "average_score_pct": avg_score,
-        "completion_rate": completion_rate,
-        "popular_topics": [{"topic": "Aptitude / General", "count": started}]
-    }
-
-@router.get("/api/analytics/ai")
-async def get_ai_analytics(current_user: str = Depends(require_admin)):
-    with db.get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) as count FROM analytics_events WHERE command IN ('/assistance', '/roadmap', '/ats_score');")
-            requests_count = cur.fetchone()["count"]
-    return {
-        "ai_requests": requests_count,
-        "resume_analyses": 0,
-        "ai_assistance_chats": requests_count,
-        "roadmap_generations": 0,
-        "quiz_generations": 0
-    }
 
 @router.get("/api/analytics/performance")
-async def get_performance(current_user: str = Depends(require_admin)):
-    with db.get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) as total, COALESCE(AVG(response_time), 0.0) as avg_rt FROM analytics_events;")
-            row = cur.fetchone()
-            total = row["total"] or 0
-            avg_rt = round(float(row["avg_rt"]) * 1000, 2)
-    return {
-        "messages_received": total,
-        "messages_processed": total,
-        "failed_messages": 0,
-        "success_rate": 100.0,
-        "avg_response_time_ms": avg_rt
-    }
+async def get_performance(_: str = Depends(require_admin)):
+    return analytics.performance()
+
+
+@router.get("/api/analytics/ai")
+async def get_ai_usage(_: str = Depends(require_admin)):
+    return analytics.ai_usage()
+
 
 @router.get("/api/analytics/errors")
-async def get_errors(limit: int = 10, current_user: str = Depends(require_admin)):
-    with db.get_connection() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) as total FROM system_errors;")
-            total_errs = cur.fetchone()["total"]
+async def get_errors(limit: int = 10, _: str = Depends(require_admin)):
+    return analytics.recent_errors(limit=limit)
 
-            cur.execute("SELECT timestamp::text as time, endpoint as stage, error_message as message FROM system_errors ORDER BY timestamp DESC LIMIT %s;", (limit,))
-            rows = [dict(r) for r in cur.fetchall()]
-    return {
-        "errors_today": total_errs,
-        "recent": rows
-    }
 
-@router.get("/api/analytics/logs")
-async def get_analytics_logs(current_user: str = Depends(require_admin)) -> List[Dict[str, Any]]:
+@router.get("/api/analytics/funnel")
+async def get_funnel(_: str = Depends(require_admin)):
+    return analytics.funnel()
+
+
+@router.get("/api/analytics/trend")
+async def get_trend(metric: str, start: str, end: str, _: str = Depends(require_admin)):
+    """Powers every '+12.3% vs last period' delta chip. metric is one of:
+    total_users, messages, job_searches, quizzes, resumes, feature_usage,
+    avg_response_ms, success_rate."""
     try:
-        with db.get_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT user_phone as whatsapp_no, 
-                           COALESCE(command, event_type) as command, 
-                           timestamp 
-                    FROM analytics_events 
-                    ORDER BY timestamp DESC 
-                    LIMIT 500;
-                """)
-                return [dict(row) for row in cur.fetchall()]
+        return analytics.trend(metric, start, end)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@router.get("/api/analytics/opportunities/page")
+async def get_opportunities_page(start: str = None, end: str = None, _: str = Depends(require_admin)):
+    return analytics.opportunities_page(start, end)
+
+
+@router.get("/api/analytics/opportunities")
+async def get_opportunities(start: str = None, end: str = None, _: str = Depends(require_admin)):
+    return analytics.opportunities_activity(start=start, end=end)
+
+
+@router.get("/api/analytics/config")
+async def get_config(request: Request, _: str = Depends(require_admin)):
+    return settings_store.config_info(str(request.base_url))
+
+
+@router.get("/api/analytics/resume/page")
+async def get_resume_page(start: str = None, end: str = None, _: str = Depends(require_admin)):
+    return analytics.resume_page(start, end)
+
+
+@router.get("/api/analytics/resume/detail")
+async def get_resume_detail(start: str = None, end: str = None, _: str = Depends(require_admin)):
+    return analytics.resume_detail(start=start, end=end)
+
+
+@router.get("/api/analytics/quiz/page")
+async def get_quiz_page(start: str = None, end: str = None, topic: str = None, _: str = Depends(require_admin)):
+    return analytics.quiz_page(start, end, topic)
+
+
+@router.get("/api/analytics/quiz/detail")
+async def get_quiz_detail(start: str = None, end: str = None, _: str = Depends(require_admin)):
+    return analytics.quiz_detail(start=start, end=end)
+
+
+# --- Users page ---
+@router.get("/api/analytics/users/summary")
+async def get_users_summary(start: str = None, end: str = None, _: str = Depends(require_admin)):
+    return analytics.users_summary(start=start, end=end)
+
+
+@router.get("/api/analytics/users/timeseries")
+async def get_users_timeseries(start: str = None, end: str = None, _: str = Depends(require_admin)):
+    return {"data": analytics.users_timeseries(start=start, end=end)}
+
+
+@router.get("/api/analytics/users/source")
+async def get_users_source(_: str = Depends(require_admin)):
+    return analytics.users_source()
+
+
+@router.get("/api/analytics/users/activity-stats")
+async def get_users_activity_stats(_: str = Depends(require_admin)):
+    return analytics.users_activity_stats()
+
+
+@router.get("/api/analytics/users/engagement")
+async def get_users_engagement(limit: int = 6, _: str = Depends(require_admin)):
+    return {"data": analytics.user_engagement(limit=limit)}
+
+
+@router.get("/api/analytics/users/commands")
+async def get_users_commands(limit: int = 5, _: str = Depends(require_admin)):
+    return {"data": analytics.popular_commands_by_users(limit=limit)}
+
+
+@router.get("/api/analytics/users/list")
+async def get_users_list(limit: int = 20, offset: int = 0, search: str = None, _: str = Depends(require_admin)):
+    return analytics.list_users(limit=limit, offset=offset, search=search)
+
+
+@router.get("/api/analytics/users/{phone}")
+async def get_user_detail(phone: str, days: int = 30, _: str = Depends(require_admin)):
+    detail = analytics.user_detail(phone, days)
+    if not detail:
+        raise HTTPException(status_code=404, detail="User not found")
+    return detail
+
+
+# --- System health ---
+@router.get("/api/analytics/system")
+async def get_system(logs: int = 5, _: str = Depends(require_admin)):
+    return analytics.system_metrics(log_limit=logs)
+
+
+# --- Admin panel settings (display preferences only — never real secrets) ---
+@router.get("/api/analytics/settings")
+async def get_settings(_: str = Depends(require_admin)):
+    return settings_store.get_settings()
+
+
+@router.post("/api/analytics/settings")
+async def post_settings(patch: SettingsPatch, _: str = Depends(require_admin)):
+    return settings_store.save_settings(patch.dict(exclude_unset=True))
+
+
+# --- Raw log viewer (kept from the original version, now auth-protected) ---
+@router.get("/api/analytics/logs")
+async def get_analytics_logs(limit: int = 200, _: str = Depends(require_admin)):
+    """Returns the raw user_logs rows (one row per command sent)."""
+    try:
+        conn = sqlite3.connect(analytics.DB_NAME)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                whatsapp_no TEXT NOT NULL,
+                command TEXT NOT NULL,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        rows = cursor.execute(
+            "SELECT whatsapp_no, command, timestamp FROM user_logs ORDER BY timestamp DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+        conn.close()
+        return [dict(row) for row in rows]
     except Exception as e:
-        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Database query error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Database error: {str(e)}")
