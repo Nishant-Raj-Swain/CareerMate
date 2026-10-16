@@ -15,6 +15,8 @@ from contextlib import contextmanager
 from psycopg2.extras import RealDictCursor
 from datetime import datetime, timedelta
 
+DB_NAME = os.getenv("ANALYTICS_DB_PATH", "bot_analytics.db")
+
 
 
 # Commands considered "a feature" vs plumbing commands, used by the funnel
