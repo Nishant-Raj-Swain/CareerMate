@@ -2,12 +2,15 @@
 # Small persisted key/value store for the admin panel's own preferences
 # (bot display name, welcome message, notification toggles, theme).
 #
-# Connected to PostgreSQL/Supabase via database.py
+# Deliberately separate from real secrets: WhatsApp tokens, the Meta app
+# secret, and the database URL are never read from or written to this
+# table. Those stay in environment variables on Render, and the Settings
+# page only ever displays whether they're configured, never their value.
 
 import json
-import os
-from datetime import datetime
-import database as db
+from urllib.parse import urlparse
+
+import analytics
 
 DEFAULTS = {
     "bot_name": "CareerMate",
@@ -29,26 +32,24 @@ DEFAULTS = {
 
 
 def _conn():
-    return db.get_connection()
+    return analytics._conn()
 
 
 def init_settings_db():
+    """Creates the admin_settings table in Postgres if needed (safe on every startup)."""
     with _conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute('''
-                CREATE TABLE IF NOT EXISTS admin_settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT NOT NULL,
-                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            ''')
+        conn.raw('''
+            CREATE TABLE IF NOT EXISTS admin_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            )
+        ''')
 
 
 def get_settings() -> dict:
     with _conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT key, value FROM admin_settings")
-            rows = cur.fetchall()
+        rows = conn.execute("SELECT key, value FROM admin_settings").fetchall()
     stored = {r["key"]: json.loads(r["value"]) for r in rows}
     merged = dict(DEFAULTS)
     merged.update(stored)
@@ -63,13 +64,12 @@ def save_settings(patch: dict) -> dict:
     isn't one of the known, safe, non-secret preference fields."""
     clean = {k: v for k, v in (patch or {}).items() if k in ALLOWED_KEYS}
     with _conn() as conn:
-        with conn.cursor() as cur:
-            for k, v in clean.items():
-                cur.execute(
-                    """INSERT INTO admin_settings (key, value, updated_at) VALUES (%s, %s, %s)
-                       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at""",
-                    (k, json.dumps(v), datetime.utcnow().isoformat())
-                )
+        for k, v in clean.items():
+            conn.raw(
+                "INSERT INTO admin_settings (key, value, updated_at) VALUES (%s, %s, NOW()) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()",
+                (k, json.dumps(v))
+            )
     return get_settings()
 
 
@@ -77,18 +77,18 @@ def config_info(base_url: str) -> dict:
     """Read-only, NON-secret facts for the Settings page: which integrations
     are configured (booleans only - never the values), the public webhook
     URL, and a live record count. Secret values are never returned."""
+    import os
+
     def has(*names):
         return any((os.getenv(n) or "").strip() for n in names)
 
     with _conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) c FROM analytics_events")
-            total = cur.fetchone()["c"]
-            try:
-                cur.execute("SELECT COUNT(*) c FROM user_logs")
-                total += cur.fetchone()["c"]
-            except Exception:
-                pass
+        total = conn.execute("SELECT COUNT(*) c FROM analytics_events").fetchone()["c"]
+        total += conn.raw("SELECT COUNT(*) c FROM users").fetchone()["c"]
+
+    # connection string without credentials, for display only
+    u = urlparse(os.getenv("DATABASE_URL") or "")
+    db_url = f"postgresql://{u.hostname}{':' + str(u.port) if u.port else ''}{u.path}" if u.hostname else "postgresql://"
 
     base = base_url.rstrip("/")
     if base.startswith("http://") and "localhost" not in base and "127.0.0.1" not in base:
@@ -102,7 +102,7 @@ def config_info(base_url: str) -> dict:
             "verify_token_set": has("WEBHOOK_VERIFY_TOKEN"),
             "app_secret_set": has("META_APP_SECRET"),
         },
-        "database": {"type": "PostgreSQL", "file": "Supabase", "total_records": total},
+        "database": {"type": "PostgreSQL", "url": db_url, "total_records": total},
         "env_vars": [
             {"name": n, "set": has(*alts)} for n, alts in (
                 ("WHATSAPP_ACCESS_TOKEN", ("WHATSAPP_ACCESS_TOKEN", "WHATSAPP_TOKEN")),
@@ -113,7 +113,7 @@ def config_info(base_url: str) -> dict:
                 ("NVIDIA_API_KEY", ("NVIDIA_API_KEY", "NIM_API_KEY")),
                 ("OPENROUTER_API_KEY", ("OPENROUTER_API_KEY",)),
                 ("GEMINI_API_KEY", ("GEMINI_API_KEY", "GOOGLE_API_KEY")),
-                ("ANALYTICS_DB_PATH", ("ANALYTICS_DB_PATH",)),
+                ("DATABASE_URL", ("DATABASE_URL",)),
             )
         ],
         "ai_providers": [
