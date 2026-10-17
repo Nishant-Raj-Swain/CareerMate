@@ -376,7 +376,7 @@ async def command(phone: str, text: str):
         await wa.menu(phone)
         return
 
-    if cmd == "/ats_score":
+    if cmd in ("/ats_score", "/ats"):
         target_role = parts[1].strip() if len(parts) > 1 else "Data Analyst / Software Role"
         user = db.get_user(phone)
         existing_resume = user.get("resume")
