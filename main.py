@@ -42,6 +42,7 @@ APP_SECRET = os.getenv("META_APP_SECRET", "").strip()
 import database as db
 import pdf_service
 import chat_pdf  # NEW: /chat_pdf (RAG over a PDF the user sends)
+import notes_utube  # NEW: /utube_notes (YouTube link -> point-wise notes + PDF)
 import quiz  # NEW: /practice (category -> topic -> 20 random MCQs), same job as quiz_service
 import image_service
 from ai_service import AIService
@@ -152,7 +153,7 @@ async def send_next_question(phone: str, state: dict):
 
     q = questions[idx]
     opts_text = ""
-    opt_labels = ["A", "B", "C", "D"]
+    opt_labels = ["A", "B", "C", "D", "E"]
     for i, opt in enumerate(q.get("options", [])):
         label = opt_labels[i] if i < len(opt_labels) else str(i+1)
         opts_text += f"\n*{label}.* {opt}"
@@ -218,9 +219,15 @@ async def handle_text(phone: str, text: str):
             await wa.text(phone, part)
         return
 
+    # --- /utube_notes: waiting for the YouTube link ---
+    if mode == notes_utube.MODE:
+        if await notes_utube.handle(phone, text, say=lambda m: wa.text(phone, m)):
+            await wa.menu(phone)
+        return
+
     # --- PRACTICE MENU (/practice): user is choosing a category / topic ---
     if mode == quiz.MODE:
-        msgs, questions, topic = await quiz.practice_reply(phone, text)
+        msgs, questions, topic = await quiz.practice_reply(phone, text, notify=lambda m: wa.text(phone, m))
         await _practice_output(phone, msgs, questions, topic)
         return
 
@@ -250,10 +257,10 @@ async def handle_text(phone: str, text: str):
             return
 
         ans_upper = text.strip().upper()
-        mapping = {"A": 0, "B": 1, "C": 2, "D": 3}
+        mapping = {"A": 0, "B": 1, "C": 2, "D": 3, "E": 4}
 
         if ans_upper not in mapping:
-            await wa.text(phone, "⚠️ Please reply with option **A**, **B**, **C**, **D**, or send **exit** to quit the test.")
+            await wa.text(phone, "⚠️ Please reply with the option letter (**A**, **B**, **C**, **D**, or **E** if shown), or send **exit** to quit the test.")
             return
 
         user_choice = mapping[ans_upper]
@@ -267,7 +274,7 @@ async def handle_text(phone: str, text: str):
                 state["score"] = state.get("score", 0) + 1
                 await wa.text(phone, "✅ *Correct!*")
             else:
-                opt_labels = ["A", "B", "C", "D"]
+                opt_labels = ["A", "B", "C", "D", "E"]
                 correct_label = opt_labels[correct_idx] if correct_idx < len(opt_labels) else "N/A"
                 await wa.text(phone, f"❌ *Incorrect.* Correct Answer: *{correct_label}*")
 
@@ -429,10 +436,15 @@ async def command(phone: str, text: str):
             )
         return
 
+    if cmd == "/utube_notes":  # asks for a YouTube link (or uses one given inline), then sends notes + PDF
+        if await notes_utube.start(phone, parts[1].strip() if len(parts) > 1 else "", say=lambda m: wa.text(phone, m)):
+            await wa.menu(phone)
+        return
+
     if cmd == "/practice":  # browse categories -> topics -> 20 random questions 
         db.save_state(phone, {})
         await wa.text(phone, "⏳ Loading the practice menu...")
-        msgs, questions, topic = await quiz.practice_start(phone, parts[1].strip() if len(parts) > 1 else "")
+        msgs, questions, topic = await quiz.practice_start(phone, parts[1].strip() if len(parts) > 1 else "", notify=lambda m: wa.text(phone, m))
         await _practice_output(phone, msgs, questions, topic)
         return
 
