@@ -42,6 +42,7 @@ APP_SECRET = os.getenv("META_APP_SECRET", "").strip()
 import database as db
 import pdf_service
 import chat_pdf  # NEW: /chat_pdf (RAG over a PDF the user sends)
+import quiz  # NEW: /practice (category -> topic -> 20 random MCQs), same job as quiz_service
 import image_service
 from ai_service import AIService
 from agent import build_agent
@@ -143,7 +144,7 @@ async def send_next_question(phone: str, state: dict):
             f"🎉 *{topic} Quiz Completed!*\n\n"
             f"📊 *Final Score:* {score} / {total}\n"
             f"Percentage: {(score/total)*100:.1f}%\n\n"
-            f"Type `/prepare <topic>` to try another topic!"
+            f"Type `/practice` to pick another topic (or `/prepare <topic>`)!"
         )
         db.save_state(phone, {})
         await wa.menu(phone)
@@ -192,6 +193,20 @@ async def handle_roadmap_generation(phone: str, topic: str):
     await wa.menu(phone)
 
 
+async def _practice_output(phone: str, msgs, questions, topic):
+    """Sends the practice menu messages; when a topic was chosen, starts the normal quiz on it."""
+    for m in msgs:
+        await wa.text(phone, m)
+    if not questions:
+        if not db.get_user(phone).get("state"):  # menu was closed -> show the main menu
+            await wa.menu(phone)
+        return
+    analytics.log_event(phone, "quiz_start", meta={"topic": topic, "count": len(questions), "source": "practice"})
+    quiz_state = {"mode": "quiz", "topic": topic, "questions": questions, "current_index": 0, "score": 0}
+    db.save_state(phone, quiz_state)
+    await send_next_question(phone, quiz_state)
+
+
 async def handle_text(phone: str, text: str):
     user = db.get_user(phone)
     state = user.get("state", {})
@@ -199,8 +214,14 @@ async def handle_text(phone: str, text: str):
 
     # --- CHAT WITH PDF MODE ---
     if mode == "chat_pdf":
-        for part in await chat_pdf.handle_question(phone, text):
+        for part in await chat_pdf.handle_question(phone, text, notify=lambda m: wa.text(phone, m)):
             await wa.text(phone, part)
+        return
+
+    # --- PRACTICE MENU (/practice): user is choosing a category / topic ---
+    if mode == quiz.MODE:
+        msgs, questions, topic = await quiz.practice_reply(phone, text)
+        await _practice_output(phone, msgs, questions, topic)
         return
 
     # --- QUIZ INTERACTION MODE ---
@@ -332,6 +353,13 @@ async def command(phone: str, text: str):
     if cmd == "/chat_pdf":
         await wa.text(phone, await chat_pdf.start(phone))
         return
+    if cmd == "/summary":  # shortcut inside a PDF chat, e.g. "/summary", "/summary brief", "/summary pages 2-4"
+        if chat_pdf.is_active((db.get_user(phone) or {}).get("state")):
+            for part in await chat_pdf.handle_question(phone, text, notify=lambda m: wa.text(phone, m)):
+                await wa.text(phone, part)
+        else:
+            await wa.text(phone, "📄 Send */chat_pdf* first, then upload a PDF and I'll summarise it.")
+        return
     if chat_pdf.is_active((db.get_user(phone) or {}).get("state")):
         goodbye = await chat_pdf.exit(phone)
         if cmd == "/exit":
@@ -376,7 +404,7 @@ async def command(phone: str, text: str):
         await wa.menu(phone)
         return
 
-    if cmd in ("/ats_score", "/ats"):
+    if cmd == "/ats_score":
         target_role = parts[1].strip() if len(parts) > 1 else "Data Analyst / Software Role"
         user = db.get_user(phone)
         existing_resume = user.get("resume")
@@ -399,6 +427,13 @@ async def command(phone: str, text: str):
                 f"Target Role: *{target_role}*\n\n"
                 f"Please upload your resume (PDF/DOCX) or paste your full resume text below."
             )
+        return
+
+    if cmd == "/practice":  # browse categories -> topics -> 20 random questions 
+        db.save_state(phone, {})
+        await wa.text(phone, "⏳ Loading the practice menu...")
+        msgs, questions, topic = await quiz.practice_start(phone, parts[1].strip() if len(parts) > 1 else "")
+        await _practice_output(phone, msgs, questions, topic)
         return
 
     if cmd == "/prepare":
