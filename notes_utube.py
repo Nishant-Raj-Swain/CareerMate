@@ -1,8 +1,8 @@
 # notes_utube.py
 # ---------------------------------------------------------------------------
-# /notes_utube - YouTube link in, study notes out (WhatsApp summary + a PDF).
+# /utube_notes - YouTube link in, study notes out (WhatsApp summary + a PDF).
 #
-#   user:  /notes_utube
+#   user:  /utube_notes
 #   bot:   "Send me the YouTube link"
 #   user:  https://youtu.be/xxxxxxxxxxx
 #   bot:   progress messages, then thumbnail + summary / takeaways / outline + a PDF with the full notes
@@ -30,7 +30,7 @@
 #                              WHATSAPP_PHONE_NUMBER_ID are the same variables main.py already uses)
 #
 # main.py hooks:
-#   await notes_utube.start(phone, arg, say=lambda m: wa.text(phone, m))        # on /notes_utube [link]
+#   await notes_utube.start(phone, arg, say=lambda m: wa.text(phone, m))        # on /utube_notes [link]
 #   done = await notes_utube.handle(phone, text, say=...)                        # while state mode == MODE
 #   (handle() returns True when the job is over and the state was cleared -> show the menu)
 # ---------------------------------------------------------------------------
@@ -701,7 +701,7 @@ def is_active(state: dict | None) -> bool:
 
 
 async def start(phone: str, arg: str, say) -> bool:
-    """/notes_utube [link]. Returns True if a link was given and the job finished (state cleared)."""
+    """/utube_notes [link]. Returns True if a link was given and the job finished (state cleared)."""
     await asyncio.to_thread(db.save_state, phone, {"mode": MODE})
     if arg and extract_video_id(arg):
         return await handle(phone, arg, say)
@@ -799,7 +799,7 @@ async def _run(phone: str, vid: str, say) -> None:
         await say("📄 I couldn't attach the PDF, so here are the full notes:")
         for m in render_full_text(notes):
             await say(m)
-    await say("✅ Done! Send */notes_utube* for another video, or */menu* for the menu.")
+    await say("✅ Done! Send */utube_notes* for another video, or */menu* for the menu.")
 
 
 if __name__ == "__main__":  # pragma: no cover
