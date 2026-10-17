@@ -101,7 +101,7 @@ class WhatsApp:
             "⚡ /news - Get today's top tech news cards\n"
             "🏆 /competitions - Latest tech competitions\n"
             "💼 /internships - Latest internships\n"
-            "📝 /prepare <topic> - Practice quiz (e.g. /prepare python)\n"
+            "📝 /practice - helps to Practice quiz \n"
             "🎯 /ats <role> - Evaluate ATS score (e.g. /ats Devops)\n"
             "📄 /chat_pdf - Chat & ask questions with your PDF\n"
             "📄 /send - Upload or review your saved resume\n"
