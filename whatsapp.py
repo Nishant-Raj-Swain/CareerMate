@@ -106,6 +106,7 @@ class WhatsApp:
             "📄 /chat_pdf - Chat & ask questions with your PDF\n"
             "📄 /send - Upload or review your saved resume\n"
             "🔍 /job_search - Search for open job roles\n"
+            "📺 /utube_notes - Get detailed notes from a YouTube link\n"
             "🗺️ /roadmap <topic> - Get an official/AI roadmap\n"
             "💬 /assistance - Ask any career question\n"
             "🚫 /cancel - Exit active quiz or operation\n"
