@@ -346,7 +346,9 @@ def _block_containers(soup):
     if not markers:                                   # fallback: group by the radio buttons next to the options
         for inp in soup.find_all("input", attrs={"type": "radio"}):
             node = inp
-            while node is not None and node.parent is not None:
+            for _ in range(12):
+                if node is None or node.parent is None:
+                    break
                 node = node.parent
                 text = node.get_text("\n", strip=True)
                 if re.search(r"(?m)^\(?A[\).:]", text) and re.search(r"(?m)^\(?B[\).:]", text):
@@ -357,7 +359,9 @@ def _block_containers(soup):
         return blocks
     for m in markers:
         node = m
-        while node is not None and node.parent is not None:
+        for _ in range(12):
+            if node is None or node.parent is None:
+                break
             node = node.parent
             text = node.get_text("\n", strip=True)
             if re.search(r"(?m)^\(?A[\).:]", text) and re.search(r"(?m)^\(?B[\).:]", text):
@@ -371,7 +375,11 @@ def _block_containers(soup):
 
 
 def parse_block(node) -> dict | None:
-    toks = [t for t in node.stripped_strings]
+    return parse_tokens([t for t in node.stripped_strings])
+
+
+def parse_tokens(toks: list[str]) -> dict | None:
+    """One question from its visible text pieces: [number] question A) opt B) opt ... [Answer: Option X] [Solution ...]"""
     i = 0
     if toks and re.fullmatch(r"\d{1,3}[\).:]?", toks[0]):          # leading question number
         i = 1
@@ -424,32 +432,113 @@ def parse_block(node) -> dict | None:
 
 
 LAST_STATS: dict = {}
+_INT = re.compile(r"\d{1,3}[\).:]?$")
+_LETTER_START = re.compile(r"^\(?[A-Ea-e][\).:]")
+
+
+def _add_letters_to_radios(soup) -> None:
+    """If the options have no visible A) B) labels (drawn by CSS), give each radio group synthetic ones."""
+    groups: dict = {}
+    for inp in soup.find_all("input", attrs={"type": "radio"}):
+        groups.setdefault(inp.get("name") or id(inp.parent), []).append(inp)
+    for radios in groups.values():
+        first = radios[0]
+        near = " ".join(filter(None, [
+            (first.find_previous(string=True) or "").strip() if first.find_previous(string=True) else "",
+            first.parent.get_text(" ", strip=True)[:8] if first.parent else ""]))
+        if _LETTER_START.match(near.strip()) or len(radios) < 2:
+            continue
+        for n, r in enumerate(radios[:6]):
+            tag = soup.new_tag("span"); tag.string = f"{chr(65 + n)})"
+            r.insert_before(tag)
+
+
+def _tokens(soup) -> list[str]:
+    for t in soup.find_all(["script", "style", "noscript", "svg"]):
+        t.decompose()
+    return [t for t in soup.stripped_strings]
+
+
+def _slice_questions(toks: list[str]) -> list[list[str]]:
+    """Cuts the page's text pieces into one slice per question, using the A) B) option runs and the question numbers."""
+    runs = []
+    for i, t in enumerate(toks):
+        a = _LABEL.match(t) or _LABEL_TEXT.match(t)
+        if a and a.group(1).upper() == "A":
+            window = toks[i + 1:i + 10]
+            if any((_LABEL.match(w) or _LABEL_TEXT.match(w)) and (_LABEL.match(w) or _LABEL_TEXT.match(w)).group(1).upper() == "B"
+                   for w in window):
+                runs.append(i)
+    starts, prev_num, prev_run = [], None, -1
+    for a in runs:
+        lo = max(prev_run + 1, a - 80)
+        cand = None
+        want = str(prev_num + 1) if prev_num is not None else None
+        for j in range(a - 1, lo - 1, -1):
+            if _INT.match(toks[j]) and j + 1 < a and len(toks[j + 1]) >= 8 or (_INT.match(toks[j]) and j + 1 < a and j + 2 < a):
+                num = re.sub(r"\D", "", toks[j])
+                if want is None or num == want:
+                    cand = j; break
+        if cand is None:                                   # no matching number: any number, else just before the options
+            for j in range(a - 1, lo - 1, -1):
+                if _INT.match(toks[j]) and j + 1 < a:
+                    cand = j; break
+        if cand is None:
+            cand = max(lo, a - 1)
+            for j in range(a - 1, lo - 1, -1):             # start after the previous question's controls
+                if toks[j].lower() in ("save", "report", "share", "discuss", "view answer"):
+                    cand = j + 1; break
+        starts.append(cand)
+        m = re.match(r"\d+", toks[cand]) if _INT.match(toks[cand]) else None
+        prev_num = int(m.group()) if m else (prev_num + 1 if prev_num is not None else None)
+        prev_run = a
+    slices = []
+    for k, st in enumerate(starts):
+        end = starts[k + 1] if k + 1 < len(starts) else len(toks)
+        slices.append(toks[st:end])
+    return slices
 
 
 def parse_questions(html: str, source: str = "") -> list[dict]:
     """All usable questions on one topic page: question, options (<= MAX_OPTIONS), correct index."""
     soup = BeautifulSoup(html, "html.parser")
-    out = []
-    blocks = _block_containers(soup)
-    stats = {"blocks": len(blocks), "unparsed": 0, "no_answer": 0, "too_many_options": 0, "bad": 0}
-    for node in blocks:
-        q = parse_block(node)
+    _add_letters_to_radios(soup)
+    out, seen = [], set()
+    stats = {"blocks": 0, "unparsed": 0, "no_answer": 0, "too_many_options": 0, "bad": 0, "method": "dom"}
+
+    def add(q):
         if not q:
-            stats["unparsed"] += 1; continue
+            stats["unparsed"] += 1; return
         if not q["answer_letter"]:
-            stats["no_answer"] += 1; continue                      # no answer in the page -> cannot grade it
+            stats["no_answer"] += 1; return                       # no answer in the page -> cannot grade it
         idx = ord(q["answer_letter"]) - 65
         if len(q["options"]) > MAX_OPTIONS:
-            stats["too_many_options"] += 1; continue
+            stats["too_many_options"] += 1; return
         if idx >= len(q["options"]) or not q["question"] or not all(q["options"]):
-            stats["bad"] += 1; continue
+            stats["bad"] += 1; return
+        key = re.sub(r"\W+", "", q["question"].lower())[:100]
+        if key in seen:
+            return
+        seen.add(key)
         out.append({"question": q["question"], "options": q["options"], "correct": idx,
                     "explanation": q["explanation"], "source": source})
+
+    blocks = _block_containers(soup)
+    stats["blocks"] = len(blocks)
+    for node in blocks:
+        add(parse_block(node))
+    if not out:                                                    # markup-independent fallback: read the page's text in order
+        stats.update(method="text", unparsed=0, no_answer=0, too_many_options=0, bad=0)
+        slices = _slice_questions(_tokens(soup))
+        stats["blocks"] = len(slices)
+        for sl in slices:
+            add(parse_tokens(sl))
     LAST_STATS.clear(); LAST_STATS.update(stats, usable=len(out))
     if not out:
         log.warning("no usable questions on %s: %s | page text starts: %r", source or "page", stats,
                     BeautifulSoup(html, "html.parser").get_text(" ", strip=True)[:200])
     return out
+
 
 _FIXED_OPTION = re.compile(r"\b(all|none|both|neither)\b.*\b(above|these|them|of the|and)\b|^\s*(a|b|c|d)\s*(and|&|,)", re.I)
 
@@ -563,7 +652,7 @@ async def get_questions(topic_url: str, total: int = 20, rng: random.Random | No
         tried.add((section, page))
         url = _page_url(topic_url, section, page)
         try:
-            qs = parse_questions(await _get(url), url)
+            qs = await asyncio.to_thread(parse_questions, await _get(url), url)
         except ScrapeError as e:
             log.warning("page failed: %s", e)
             return
@@ -732,9 +821,23 @@ async def _probe(url: str):  # pragma: no cover
         print("No questions parsed. Save the page (Ctrl+S) and send it to the developer to adjust the parser.")
 
 
+async def _dump(url: str):  # pragma: no cover
+    """Prints the raw HTML around the first question, so the parser can be adjusted to the real markup."""
+    html = await _get(url)
+    open("page_dump.html", "w", encoding="utf-8").write(html)
+    print(f"saved the whole page to page_dump.html ({len(html)} chars)")
+    for label, pat in (("FIRST OPTION / RADIO", r"<input[^>]+radio|>\s*A\)|None of these"), ("ANSWER TEXT", r"Answer\s*:")):
+        m = re.search(pat, html)
+        print(f"\n===== {label} =====" if m else f"\n===== {label}: not found in the page HTML =====")
+        if m:
+            print(html[max(0, m.start() - 1800):m.start() + 1200])
+
+
 if __name__ == "__main__":  # pragma: no cover
     import sys
-    if len(sys.argv) == 3 and sys.argv[1] == "probe":
+    if len(sys.argv) == 3 and sys.argv[1] == "dump":
+        asyncio.run(_dump(sys.argv[2]))
+    elif len(sys.argv) == 3 and sys.argv[1] == "probe":
         asyncio.run(_probe(sys.argv[2]))
     elif len(sys.argv) == 3 and sys.argv[1] == "quiz":
         for n, q in enumerate(asyncio.run(get_questions(sys.argv[2])), 1):
