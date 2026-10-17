@@ -104,6 +104,7 @@ class WhatsApp:
             "📝 /prepare <topic> - Start a practice quiz (e.g. /prepare python)\n"
             "🔍 /job_search - Search for open job roles\n"
             "🗺️ /roadmap <topic> - Get an official/AI roadmap\n"
+            "📄 /chat_pdf - Chat with your PDF document\n"
             "📄 /send - Upload/review your resume and know the ats score\n"
             "💬 /assistance - Ask any career question\n"
             "🚫 /cancel - Exit current operation or active quiz\n"
