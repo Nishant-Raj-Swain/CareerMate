@@ -58,7 +58,7 @@ DELAY = float(os.getenv("QUIZ_DELAY", "1.2"))                  # seconds between
 CACHE_SECONDS = float(os.getenv("QUIZ_CACHE_HOURS", "12")) * 3600
 PAGES_PER_QUIZ = 3                                              # random pages pooled per quiz (10 questions each)
 MAX_EXTRA_PAGES = 3                                             # more pages if the pool is too small
-MAX_OPTIONS = 4                                                 # main.py's quiz handler accepts A-D
+MAX_OPTIONS = 5                                                 # A-E (some questions end with "None of these"); main.py accepts A-E
 MODE = "practice_menu"
 WA_LIMIT = 3800
 
@@ -158,6 +158,8 @@ async def _get(url: str) -> str:
                     last = str(e); _last_request = time.time(); continue
                 _last_request = time.time()
                 if r.status_code == 200:
+                    if re.search(r"Just a moment\.\.\.|cf-browser-verification|Attention Required|cf-chl", r.text[:6000]):
+                        raise ScrapeError(f"bot-protection page returned for {url}")
                     return _store("html:" + url, r.text)
                 if r.status_code in (403, 429) or r.status_code >= 500:
                     last = f"HTTP {r.status_code}"; await asyncio.sleep(2 * (attempt + 1)); continue
@@ -218,6 +220,26 @@ def _in_chrome(tag) -> bool:
     return False
 
 
+def _in_strict_chrome(tag) -> bool:
+    """Links that are certainly site chrome: <nav>/<header>/<footer>, bootstrap navbars and dropdowns, breadcrumbs."""
+    for p in tag.parents:
+        if getattr(p, "name", None) in ("nav", "header", "footer"):
+            return True
+        cls = " ".join(p.get("class", [])) if hasattr(p, "get") else ""
+        if cls and re.search(r"navbar|dropdown|footer|breadcrumb|mega-?menu|top-?menu", cls, re.I):
+            return True
+    return False
+
+
+def _norm_url(u: str) -> str:
+    return urldefrag(u)[0].split("?")[0].rstrip("/")
+
+
+def page_links(html: str, page_url: str) -> set[str]:
+    soup = BeautifulSoup(html, "html.parser")
+    return {_norm_url(urljoin(page_url, a["href"].strip())) for a in soup.find_all("a", href=True)}
+
+
 def _name_from_slug(href: str) -> str:
     slug = urlparse(href).path.strip("/").split("/")[-1]
     slug = re.sub(r"^(practice-)?mcq-questions?-on-", "", slug)
@@ -245,8 +267,17 @@ def parse_categories(html: str) -> list[dict]:
     return [{"name": n, "url": found[n], "kind": "category"} for n in CATEGORY_NAMES if n in found]
 
 
-def parse_children(html: str, page_url: str) -> dict:
-    """Items listed on a category page: leaf topics (have questions) or deeper categories."""
+def parse_children(html: str, page_url: str, exclude: set[str] | None = None) -> dict:
+    """Items listed on a category page: leaf topics (have questions) or deeper categories.
+    `exclude` = links that appear on every page (menus, footer); they are never listed as topics."""
+    exclude = exclude or set()
+    res = _parse_children(html, page_url, exclude, strict=True)
+    if not res["items"]:
+        res = _parse_children(html, page_url, exclude, strict=False)
+    return res
+
+
+def _parse_children(html: str, page_url: str, exclude: set[str], strict: bool) -> dict:
     soup = BeautifulSoup(html, "html.parser")
     leaves, cats, seen = [], [], {page_url.rstrip("/")}
     for a in soup.find_all("a", href=True):
@@ -254,7 +285,9 @@ def parse_children(html: str, page_url: str) -> dict:
         pure = urldefrag(href)[0].split("?")[0]
         if urlparse(pure).netloc and not _same_site(urlparse(pure).netloc):
             continue
-        if pure.rstrip("/") in seen:
+        if pure.rstrip("/") in seen or pure.rstrip("/") in exclude:
+            continue
+        if strict and _in_strict_chrome(a):
             continue
         if LEAF_RE.search(urlparse(pure).path):
             seen.add(pure.rstrip("/"))
@@ -310,6 +343,18 @@ def _block_containers(soup):
     markers = [a for a in soup.find_all(["a", "button", "span"])
                if a.get_text(strip=True).lower() in ("discuss", "view answer")]
     blocks, seen = [], set()
+    if not markers:                                   # fallback: group by the radio buttons next to the options
+        for inp in soup.find_all("input", attrs={"type": "radio"}):
+            node = inp
+            while node is not None and node.parent is not None:
+                node = node.parent
+                text = node.get_text("\n", strip=True)
+                if re.search(r"(?m)^\(?A[\).:]", text) and re.search(r"(?m)^\(?B[\).:]", text):
+                    names = {r.get("name") for r in node.find_all("input", attrs={"type": "radio"})}
+                    if len(names) <= 1 and id(node) not in seen:
+                        seen.add(id(node)); blocks.append(node)
+                    break
+        return blocks
     for m in markers:
         node = m
         while node is not None and node.parent is not None:
@@ -378,19 +423,32 @@ def parse_block(node) -> dict | None:
     }
 
 
+LAST_STATS: dict = {}
+
+
 def parse_questions(html: str, source: str = "") -> list[dict]:
     """All usable questions on one topic page: question, options (<= MAX_OPTIONS), correct index."""
     soup = BeautifulSoup(html, "html.parser")
     out = []
-    for node in _block_containers(soup):
+    blocks = _block_containers(soup)
+    stats = {"blocks": len(blocks), "unparsed": 0, "no_answer": 0, "too_many_options": 0, "bad": 0}
+    for node in blocks:
         q = parse_block(node)
-        if not q or not q["answer_letter"]:
-            continue                                              # no answer in the page -> cannot grade it
+        if not q:
+            stats["unparsed"] += 1; continue
+        if not q["answer_letter"]:
+            stats["no_answer"] += 1; continue                      # no answer in the page -> cannot grade it
         idx = ord(q["answer_letter"]) - 65
-        if idx >= len(q["options"]) or len(q["options"]) > MAX_OPTIONS or not q["question"] or not all(q["options"]):
-            continue
+        if len(q["options"]) > MAX_OPTIONS:
+            stats["too_many_options"] += 1; continue
+        if idx >= len(q["options"]) or not q["question"] or not all(q["options"]):
+            stats["bad"] += 1; continue
         out.append({"question": q["question"], "options": q["options"], "correct": idx,
                     "explanation": q["explanation"], "source": source})
+    LAST_STATS.clear(); LAST_STATS.update(stats, usable=len(out))
+    if not out:
+        log.warning("no usable questions on %s: %s | page text starts: %r", source or "page", stats,
+                    BeautifulSoup(html, "html.parser").get_text(" ", strip=True)[:200])
     return out
 
 _FIXED_OPTION = re.compile(r"\b(all|none|both|neither)\b.*\b(above|these|them|of the|and)\b|^\s*(a|b|c|d)\s*(and|&|,)", re.I)
@@ -450,16 +508,38 @@ async def get_categories() -> list[dict]:
     return _store("categories", items) if items else items
 
 
+async def _chrome_urls() -> set[str]:
+    """Links shared by two different category pages = menus/footers, not topics."""
+    hit = _cached("chrome")
+    if hit is not None:
+        return hit
+    chrome: set[str] = set()
+    try:
+        sets = []
+        for c in await get_categories():                      # first two category pages that load
+            try:
+                sets.append(page_links(await _get(c["url"]), c["url"]))
+            except ScrapeError:
+                continue
+            if len(sets) == 2:
+                chrome = sets[0] & sets[1]
+                break
+    except ScrapeError as e:
+        log.warning("chrome detection skipped: %s", e)
+    return _store("chrome", chrome)
+
+
 async def get_children(url: str) -> dict:
     hit = _cached("children:" + url)
     if hit is not None:
         return hit
     html = await _get(url)
-    res = parse_children(html, url)
+    chrome = await _chrome_urls()
+    res = parse_children(html, url, chrome)
     seen = {i["url"] for i in res["items"]}
     for extra in list_pagination(html, url):
         try:
-            more = parse_children(await _get(extra), extra)
+            more = parse_children(await _get(extra), extra, chrome)
         except ScrapeError:
             break
         if more["kind"] != res["kind"]:
@@ -573,9 +653,11 @@ async def _show(phone: str, title: str, items: list[dict], kind: str, trail: lis
     return _menu_messages(title, items, f"Reply with a *number* or the {word} name. Send *exit* to cancel.")
 
 
-async def _open(phone: str, item: dict, trail: list[str]):
+async def _open(phone: str, item: dict, trail: list[str], notify=None):
     """Opens a menu item: shows its children, or loads the quiz if it is a topic."""
     if item["kind"] == "topic":
+        if notify:
+            await notify(f"⏳ Fetching 20 random questions on *{item['name']}*...")
         questions = [_public(q) for q in await get_questions(item["url"], 20)]
         if not questions:
             return (["❌ I couldn't load questions for that topic right now. Please pick another one or try again shortly."],
@@ -589,7 +671,7 @@ async def _open(phone: str, item: dict, trail: list[str]):
     return msgs, None, None
 
 
-async def practice_start(phone: str, arg: str = ""):
+async def practice_start(phone: str, arg: str = "", notify=None):
     """/practice [category or topic]. Returns (messages, questions|None, topic|None)."""
     try:
         cats = await get_categories()
@@ -599,7 +681,7 @@ async def practice_start(phone: str, arg: str = ""):
             key = ALIASES.get(arg.strip().lower(), arg.strip())
             item = match_item(cats, key)
             if item:
-                return await _open(phone, item, [])
+                return await _open(phone, item, [], notify)
             questions = await fetch_quiz_questions(arg.strip(), 20)    # maybe a sub-topic name, e.g. "average"
             if questions:
                 await asyncio.to_thread(_save, phone, {})
@@ -612,7 +694,7 @@ async def practice_start(phone: str, arg: str = ""):
         return (["⚠️ Something went wrong loading the practice menu. Please try again."], None, None)
 
 
-async def practice_reply(phone: str, text: str):
+async def practice_reply(phone: str, text: str, notify=None):
     """A reply while the user is inside the practice menu."""
     import database as db
     state = (await asyncio.to_thread(db.get_user, phone)).get("state") or {}
@@ -629,7 +711,7 @@ async def practice_reply(phone: str, text: str):
         return ([f"🤔 I didn't find that. Reply with a number from 1 to {len(items)}, a name from the list, "
                  "*back* for categories, or *exit*."], None, None)
     try:
-        return await _open(phone, item, state.get("trail") or [])
+        return await _open(phone, item, state.get("trail") or [], notify)
     except Exception:
         log.exception("practice_reply failed")
         return (["⚠️ Something went wrong. Please try again."], None, None)
@@ -643,7 +725,7 @@ async def _probe(url: str):  # pragma: no cover
     print(f"children: {kids['kind']} x{len(kids['items'])}", [i["name"] for i in kids["items"][:8]])
     print("nav:", discover_nav(html))
     qs = parse_questions(html, url)
-    print(f"questions parsed on this page: {len(qs)}")
+    print(f"questions parsed on this page: {len(qs)}   stats: {LAST_STATS}")
     for q in qs[:3]:
         print(" -", q["question"][:90], "|", q["options"], "| correct:", "ABCDE"[q["correct"]])
     if not qs and LEAF_RE.search(url):
