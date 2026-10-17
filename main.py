@@ -41,6 +41,7 @@ APP_SECRET = os.getenv("META_APP_SECRET", "").strip()
 
 import database as db
 import pdf_service
+import chat_pdf  # NEW: /chat_pdf (RAG over a PDF the user sends)
 import image_service
 from ai_service import AIService
 from agent import build_agent
@@ -90,6 +91,10 @@ async def lifespan(app: FastAPI):
     init_auth_db()  # Initialized auth tables on app startup
     analytics.init_analytics_db()  # NEW: creates analytics_events if missing
     settings_store.init_settings_db()  # NEW: creates admin_settings if missing
+    try:
+        chat_pdf.init()  # NEW: creates chat_pdf tables, purges expired PDFs
+    except Exception:
+        logger.exception("chat_pdf init failed (it will retry on first use)")
     wa = WhatsApp()
     ai_service = AIService()
     news_service = NewsService(wa_access_token=WHATSAPP_TOKEN, wa_phone_id=PHONE_NUMBER_ID)
@@ -191,6 +196,12 @@ async def handle_text(phone: str, text: str):
     user = db.get_user(phone)
     state = user.get("state", {})
     mode = state.get("mode")
+
+    # --- CHAT WITH PDF MODE ---
+    if mode == "chat_pdf":
+        for part in await chat_pdf.handle_question(phone, text):
+            await wa.text(phone, part)
+        return
 
     # --- QUIZ INTERACTION MODE ---
     if mode == "quiz":
@@ -316,6 +327,20 @@ async def handle_text(phone: str, text: str):
 async def command(phone: str, text: str):
     parts = text.split(maxsplit=1)
     cmd = parts[0].lower()
+
+    # --- /chat_pdf: start, and leave (any other command ends the PDF chat and deletes the PDF) ---
+    if cmd == "/chat_pdf":
+        await wa.text(phone, await chat_pdf.start(phone))
+        return
+    if chat_pdf.is_active((db.get_user(phone) or {}).get("state")):
+        goodbye = await chat_pdf.exit(phone)
+        if cmd == "/exit":
+            await wa.text(phone, goodbye)
+            await wa.menu(phone)
+            return
+    elif cmd == "/exit":
+        await wa.menu(phone)
+        return
 
     if cmd in ("/start", "/help", "/menu", "/cancel"):
         db.save_state(phone, {})
@@ -464,6 +489,13 @@ async def process_message(message: dict):
             mode = state.get("mode")
             doc = message["document"]
             content = await wa.download(doc["id"])
+
+            if mode == "chat_pdf":  # NEW: the user sent a PDF to chat with
+                for part in await chat_pdf.handle_document(
+                    phone, doc.get("filename", "document.pdf"), content, caption=doc.get("caption")
+                ):
+                    await wa.text(phone, part)
+                return
 
             try:
                 extracted = pdf_service.extract_text(doc.get("filename", "file.pdf"), content)
