@@ -35,7 +35,7 @@ import os
 import random
 import re
 import time
-from urllib.parse import urldefrag, urljoin, urlparse
+from urllib.parse import quote_plus, urldefrag, urljoin, urlparse
 
 import httpx
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -54,7 +54,7 @@ PAGE_LIMIT = 30                 # the site's own page size (?limit=30&offset=N)
 SHOW = 10                       # jobs per WhatsApp message batch
 DETAIL_CACHE = 24 * 3600
 APPLY_LINKS = os.getenv("JOBS_APPLY_LINKS", "1") != "0"       # open each job page to find the employer's own apply link
-SHOW_SOURCE_LINK = os.getenv("JOBS_SHOW_SOURCE_LINK", "1") != "0"   # when no direct link is public, still show the source page
+SHOW_SOURCE_LINK = os.getenv("JOBS_SHOW_SOURCE_LINK", "0") == "1"   # off by default: the source site's links only redirect to the aggregator
 WA_LIMIT = 3800
 MODE = "job_browse"
 EXIT_WORDS = {"exit", "quit", "cancel", "stop", "/exit", "/cancel"}
@@ -317,7 +317,8 @@ def parse_jobs(html: str, page_url: str = "") -> list[dict]:
         exp = next((ln for ln in after if _EXP.match(ln)), "")
         sal = next((ln for ln in after if _SAL.search(ln) and re.search(r"\d|disclosed|as per", ln, re.I)), "")
         ago = next((ln for ln in after if _AGO.search(ln)), "")
-        rest = [ln for ln in after if ln not in (exp, sal, ago) and not re.match(r"^(experience|salary|posted|apply)\b", ln, re.I)]
+        rest = [ln for ln in after if ln not in (exp, sal, ago) and not re.match(r"^(experience|salary|posted|apply)\b", ln, re.I)
+                and len(ln) <= 70 and not ln.endswith(".") and not re.search(r"\b(deployed|through|organi[sz]ation|please|kindly|click|register)\b", ln, re.I)]
         sf = _slug_fields(full)
         title = _title_clean(title_raw) if title_raw and not _CTA.match(title_raw) else sf["title"]
         company = rest[0] if rest else sf["company"]
@@ -333,22 +334,67 @@ _APPLY_HREF = re.compile(r"(apply|career|recruit|hiring|opening|vacanc|jobs?\b|j
 _EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 
 
+_URL_IN_ATTR = re.compile(r"https?://[^\s'\"<>)\\]+", re.I)
+
+
+def _external(url: str) -> bool:
+    host = urlparse(url).netloc
+    return bool(host) and not _same_site(host) and not _SOCIAL.search(url)
+
+
+def _jsonld(soup) -> list[dict]:
+    import json
+    out = []
+    for sc in soup.find_all("script", type=re.compile("ld\\+json", re.I)):
+        try:
+            data = json.loads(sc.string or sc.get_text() or "")
+        except Exception:
+            continue
+        stack = data if isinstance(data, list) else [data]
+        while stack:
+            d = stack.pop()
+            if isinstance(d, dict):
+                if "@graph" in d:
+                    stack += d["@graph"] if isinstance(d["@graph"], list) else [d["@graph"]]
+                if str(d.get("@type", "")).lower() == "jobposting":
+                    out.append(d)
+    return out
+
+
 def parse_apply(html: str, page_url: str = "") -> dict:
     """The employer's own way to apply, if the job page shows one to any visitor:
-    an external apply/careers link, or an e-mail address. Never reads anything behind a login."""
+    an external apply/careers link (also from a button's onclick / data-* attribute), an e-mail address, and the
+    company's website from the page's structured job data. Never reads anything behind a login."""
     soup = BeautifulSoup(html, "lxml")
+    company_site, struct_apply = "", ""
+    for jp in _jsonld(soup):
+        org = jp.get("hiringOrganization") or {}
+        for u in (org.get("sameAs"), org.get("url")) if isinstance(org, dict) else ():
+            if isinstance(u, str) and _external(u) and not company_site:
+                company_site = u
+        u = jp.get("url")
+        if isinstance(u, str) and _external(u) and _APPLY_HREF.search(u) and not struct_apply:
+            struct_apply = u
     for t in soup(["script", "style", "noscript"]):
         t.decompose()
-    best, best_score = "", 0
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if href.startswith(("#", "javascript:", "tel:", "mailto:")):
-            continue
-        url = urljoin(page_url or BASE + "/", href)
-        host = urlparse(url).netloc
-        if not host or _same_site(host) or _SOCIAL.search(url):
+    cands: list[tuple[str, str]] = []                    # (url, visible text)
+    for el in soup.find_all(True):
+        txt = _label(el) if el.name in ("a", "button") else ""
+        vals = []
+        if el.name == "a" and el.get("href"):
+            vals.append(el["href"].strip())
+        for attr in ("data-href", "data-url", "data-link", "data-apply-url", "data-target-url", "onclick"):
+            v = el.get(attr)
+            if v:
+                vals += _URL_IN_ATTR.findall(v) if attr == "onclick" else [v.strip()]
+        for v in vals:
+            if v.startswith(("#", "javascript:", "tel:", "mailto:")):
+                continue
+            cands.append((urljoin(page_url or BASE + "/", v), txt))
+    best, best_score = struct_apply, 2 if struct_apply else 0
+    for url, txt in cands:
+        if not _external(url):
             continue                                    # the source site's own pages / redirects / social links
-        txt = _label(a)
         score = (2 if _APPLY_TEXT.search(txt) else 0) + (1 if _APPLY_HREF.search(url) else 0)
         if score > best_score:
             best, best_score = url, score
@@ -364,7 +410,7 @@ def parse_apply(html: str, page_url: str = "") -> dict:
             e = a["href"][7:].split("?")[0].strip()
             if _EMAIL.fullmatch(e) and not _same_site(e.split("@")[1]):
                 email = e
-    return {"apply": best if best_score >= 2 else "", "email": email}
+    return {"apply": best if best_score >= 2 else "", "email": email, "company_site": company_site}
 
 
 async def enrich_apply(jobs: list[dict], budget: float = 60.0) -> None:
@@ -385,7 +431,7 @@ async def enrich_apply(jobs: list[dict], budget: float = 60.0) -> None:
             except JobsError as e:
                 log.info("job page not read (%s): %s", j["url"], e)
                 continue
-        j["apply"], j["email"] = hit["apply"], hit["email"]
+        j["apply"], j["email"], j["company_site"] = hit["apply"], hit["email"], hit.get("company_site", "")
 
 
 def _page_url(url: str, offset: int) -> str:
@@ -422,8 +468,14 @@ def _job_text(n: int, j: dict) -> str:
         lines.append(f"✅ Apply: {j['apply']}")
     if j.get("email"):
         lines.append(f"📧 Send your resume to: {j['email']}")
-    if not j.get("apply") and not j.get("email") and SHOW_SOURCE_LINK:
-        lines.append(f"🔗 Job page: {j['url']}")            # no public direct link: the source page is all there is
+    if not j.get("apply") and not j.get("email"):
+        if j.get("company_site"):
+            lines.append(f"🌐 Company site (look for Careers): {j['company_site']}")
+        else:                                           # no public direct link anywhere: a search is the honest next step
+            q = quote_plus(f"{j['company']} {j['title']} careers apply".strip())
+            lines.append(f"🔎 Direct link not public - search: https://www.google.com/search?q={q}")
+        if SHOW_SOURCE_LINK:
+            lines.append(f"🔗 Job page: {j['url']}")
     return "\n".join(lines)
 
 
@@ -612,8 +664,27 @@ async def _cli(argv):  # pragma: no cover
             print("    card <%s class=%r>, lines:" % (card.name, " ".join(card.get("class", []))[:60]))
             for ln in [x.strip() for x in card.get_text("\n").split("\n") if x.strip()][:14]:
                 print("      |", ln[:100])
+    elif len(argv) >= 3 and argv[1] == "debugjob":    # what a single job page really contains (paste this output to get it fixed)
+        html = await _get(argv[2], 0)
+        open("job_detail_debug.html", "w", encoding="utf-8").write(html)
+        soup = BeautifulSoup(html, "lxml")
+        print(f"saved job_detail_debug.html ({len(html)} bytes)")
+        print("parse_apply ->", parse_apply(html, argv[2]))
+        print("\nJSON-LD JobPosting:", [{k: (str(v)[:90]) for k, v in jp.items() if k in ("url", "hiringOrganization", "directApply", "applicantLocationRequirements")} for jp in _jsonld(soup)])
+        print("\nelements that look like Apply / external links:")
+        n = 0
+        for el in soup.find_all(["a", "button", "input"]):
+            txt = _label(el) or el.get("value", "")
+            href = el.get("href", "")
+            attrs = {k: str(v)[:100] for k, v in el.attrs.items() if k in ("href", "onclick", "data-href", "data-url", "data-link", "class", "id", "type") and v}
+            if re.search(r"apply|career|website|login|register", txt, re.I) or (href.startswith("http") and _external(urljoin(argv[2], href))):
+                print("  <%s> %r %s" % (el.name, txt[:50], attrs)); n += 1
+                if n >= 25:
+                    break
+        print("\nemails in text:", sorted(set(_EMAIL.findall(soup.get_text(" ")))))
+        print("page says login/register to apply:", bool(re.search(r"(login|log in|register|sign in).{0,40}apply|apply.{0,40}(login|log in|register|sign in)", soup.get_text(" "), re.I)))
     else:
-        print('usage: python job_browse.py menu | jobs "<listing url>" | debug "<listing url>"')
+        print('usage: python job_browse.py menu | jobs "<listing url>" | debug "<listing url>" | debugjob "<job page url>"')
 
 
 if __name__ == "__main__":  # pragma: no cover
