@@ -13,6 +13,10 @@ python-docx
 google-genai
 langchain-google-genai
 beautifulsoup4
+youtube-transcript-api
+reportlab
+pillow
+requests
 
 # Admin Dashboard & Analytics
 streamlit
