@@ -39,6 +39,8 @@ from __future__ import annotations
 
 import asyncio
 import io
+import math
+import threading
 import json
 import logging
 import os
@@ -55,9 +57,10 @@ import database as db
 log = logging.getLogger("notes_utube")
 
 MODE = "notes_utube"
-WINDOW_CHARS = 9000                       # transcript characters per notes window
+WINDOW_CHARS = 12000                      # transcript characters per notes window (bigger = fewer AI calls)
 MAX_MINUTES = int(float(os.getenv("NOTES_MAX_MINUTES", "240")))
 MAX_PER_DAY = int(os.getenv("NOTES_MAX_PER_DAY", "6"))
+WORKERS = max(1, int(os.getenv("NOTES_WORKERS", "3")))     # parallel AI calls for long videos
 WA_LIMIT = 3800
 EXIT_WORDS = {"exit", "cancel", "stop", "quit", "/exit", "/cancel", "back"}
 CACHE_SECONDS = 24 * 3600
@@ -159,8 +162,16 @@ class TranscriptUnavailable(Exception):
         self.kind = kind          # "none" | "blocked" | "unavailable" | "error"
 
 
-def fetch_transcript(video_id: str) -> dict:
-    """{'lang','lang_name','generated','snippets':[(start_sec, text)], 'duration'}"""
+def translate_mode() -> str:
+    """youtube (default): YouTube's free caption translation, no AI call | none: the notes model translates while
+    writing | llm: a separate AI translation pass per chunk (best wording, most AI calls)."""
+    m = _env("NOTES_TRANSLATE", "youtube").lower()
+    return m if m in ("youtube", "none", "llm") else "youtube"
+
+
+def fetch_transcript(video_id: str, translate_en: bool = False) -> dict:
+    """{'lang','lang_name','generated','translated','snippets':[(start_sec, text)], 'duration'}
+    translate_en=True asks YouTube to translate non-English captions to English (free, no AI)."""
     try:
         from youtube_transcript_api import YouTubeTranscriptApi
         import youtube_transcript_api._errors as E
@@ -172,14 +183,23 @@ def fetch_transcript(video_id: str) -> dict:
         try:
             tl = api.list(video_id)
             tr = _pick_transcript(tl)
-            fetched = tr.fetch()
+            translated = False
+            if translate_en and not _is_english(tr.language_code) and getattr(tr, "is_translatable", False):
+                try:
+                    fetched = tr.translate("en").fetch()
+                    translated = True
+                except Exception as e:                      # not translatable after all: use the original captions
+                    log.info("YouTube translation unavailable (%s); using original captions", e)
+                    fetched = tr.fetch()
+            else:
+                fetched = tr.fetch()
             snippets = [(float(s.start), re.sub(r"\s+", " ", s.text.replace("\n", " ")).strip()) for s in fetched]
             snippets = [(a, t) for a, t in snippets if t and not re.fullmatch(r"\[[^\]]*\]", t)]   # drop [Music] etc.
             if not snippets:
                 raise TranscriptUnavailable("none", "empty transcript")
             last_s = fetched[-1]
             return {"lang": tr.language_code, "lang_name": tr.language, "generated": bool(tr.is_generated),
-                    "snippets": snippets, "duration": float(last_s.start) + float(getattr(last_s, "duration", 0) or 0)}
+                    "translated": translated, "snippets": snippets, "duration": float(last_s.start) + float(getattr(last_s, "duration", 0) or 0)}
         except TranscriptUnavailable:
             raise
         except (E.TranscriptsDisabled, E.NoTranscriptFound) as e:
@@ -330,7 +350,8 @@ def _clean_sections(data) -> list[dict]:
 
 
 def notes_for_window(w: dict, meta: dict) -> list[dict]:
-    user = f"Video title: {meta.get('title', '')}\nChannel: {meta.get('channel', '')}\n\nTRANSCRIPT:\n{w['text']}"
+    user = (f"Video title: {meta.get('title', '')}\nChannel: {meta.get('channel', '')}\n"
+            f"{meta.get('lang_note', '')}\nTRANSCRIPT:\n{w['text']}")
     data = _json_call(SECTION_SYSTEM, user, max_tokens=4000)
     secs = _clean_sections(data)
     if secs:
@@ -348,17 +369,66 @@ def notes_for_window(w: dict, meta: dict) -> list[dict]:
         return []
 
 
+def _window_notes_safe(w: dict, meta: dict) -> tuple[list[dict], bool]:
+    """Notes for one window; a failure is retried once and never takes the whole video down."""
+    for attempt in range(2):
+        try:
+            secs = notes_for_window(w, meta)
+            if secs:
+                return secs, True
+        except Exception as e:
+            log.warning("notes window at %s failed (attempt %d): %s", fmt_ts(w["start"]), attempt + 1, e)
+        time.sleep(2.0)
+    return [], False
+
+
 def build_notes(windows: list[dict], meta: dict, progress=None) -> dict:
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        parts = list(ex.map(lambda w: notes_for_window(w, meta), windows))
-    sections = [s for p in parts for s in p]
+    """progress(done, total) is called from worker threads as parts finish."""
+    if len(windows) == 1:                       # short video: notes + summary + questions in ONE call
+        user = (f"Video title: {meta.get('title', '')}\nChannel: {meta.get('channel', '')}\n"
+                f"{meta.get('lang_note', '')}\nTRANSCRIPT:\n{windows[0]['text']}")
+        try:
+            one = _notes_from_json(_json_call(VIDEO_SYSTEM, user, max_tokens=6000) or {})
+        except Exception as e:
+            log.warning("single-call notes failed, using the normal path: %s", e)
+            one = None
+        if one:
+            for s in one["sections"]:
+                if not s["start"]:
+                    s["start"] = int(windows[0]["start"])
+            return one
+    lock, done = threading.Lock(), [0]
+
+    def work(w):
+        secs, ok = _window_notes_safe(w, meta)
+        with lock:
+            done[0] += 1
+            n = done[0]
+        if progress:
+            try:
+                progress(n, len(windows))
+            except Exception:
+                pass
+        return w, secs, ok
+    with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        results = list(ex.map(work, windows))
+    gaps = [int(w["start"]) for w, secs, ok in results if not ok]
+    sections = [s for _, secs, _ in results for s in secs]
     if not sections:
-        raise NotesError("I couldn't generate notes for this video right now. Please try again in a few minutes.")
-    # merge sections that start at the same second (windows overlapping topics), keep order
+        raise NotesError("I couldn't generate notes for this video right now (the AI service is busy or unavailable). Please try again in a few minutes.")
     sections.sort(key=lambda s: s["start"])
-    compact = "\n".join(f"- [{fmt_ts(s['start'])}] {s['title']}: " + " | ".join(p["p"] for p in s["points"][:3])[:400]
-                        for s in sections)[:14000]
-    ov = _json_call(OVERVIEW_SYSTEM, f"Video: {meta.get('title', '')}\n\nSECTION NOTES:\n{compact}", max_tokens=2500) or {}
+    # the overview sees EVERY section, however long the video: lines shrink to fit a fixed budget
+    budget = 14000
+    per = max(0, min(400, budget // max(1, len(sections)) - 30))
+    lines = []
+    for s in sections:
+        head = f"- [{fmt_ts(s['start'])}] {s['title']}"
+        lines.append(head + (": " + " | ".join(p["p"] for p in s["points"][:3])[:per] if per >= 80 else ""))
+    try:
+        ov = _json_call(OVERVIEW_SYSTEM, f"Video: {meta.get('title', '')}\n\nSECTION NOTES:\n" + "\n".join(lines), max_tokens=2500) or {}
+    except Exception as e:                       # the notes are the product; a missing front page is not fatal
+        log.warning("overview call failed: %s", e)
+        ov = {}
     glossary, seen = [], set()
     for s in sections:
         for t in s["terms"]:
@@ -373,6 +443,7 @@ def build_notes(windows: list[dict], meta: dict, progress=None) -> dict:
                       for q in (ov.get("questions") or []) if isinstance(q, dict) and q.get("q") and q.get("a")][:6],
         "sections": sections,
         "glossary": glossary[:30],
+        "gaps": gaps,
     }
 
 
@@ -393,17 +464,25 @@ def notes_from_video_url(video_id: str) -> dict:
         {"file_data": {"file_uri": f"https://www.youtube.com/watch?v={video_id}"}},
         {"text": "Create the study notes for this video as instructed."}]}],
         "systemInstruction": {"parts": [{"text": VIDEO_SYSTEM}]},
-        "generationConfig": {"maxOutputTokens": 16384, "responseMimeType": "application/json"}}
+        "generationConfig": {"maxOutputTokens": 16384, "responseMimeType": "application/json",
+                             "mediaResolution": "MEDIA_RESOLUTION_LOW"}}
     url = f"{chat_pdf._gemini_base()}/v1beta/models/{model}:generateContent"
-    data = chat_pdf._post(url, {"x-goog-api-key": key, "Content-Type": "application/json"}, body, timeout=300, retries=1)
+    data = chat_pdf._post(url, {"x-goog-api-key": key, "Content-Type": "application/json"}, body, timeout=600, retries=1)
     try:
         text = "".join(p.get("text", "") for p in data["candidates"][0]["content"]["parts"] if not p.get("thought"))
     except (KeyError, IndexError, TypeError):
         raise NotesError("no-video-fallback")
-    j = _parse_json(text) or {}
+    notes = _notes_from_json(_parse_json(text) or {})
+    if not notes:
+        raise NotesError("no-video-fallback")
+    return notes
+
+
+def _notes_from_json(j: dict) -> dict | None:
+    """Sections + overview from ONE model reply (video fallback, and short transcripts)."""
     sections = _clean_sections(j)
     if not sections:
-        raise NotesError("no-video-fallback")
+        return None
     gloss, seen = [], set()
     for s in sections:
         for t in s["terms"]:
@@ -437,6 +516,9 @@ def render_whatsapp(video_id: str, meta: dict, notes: dict, info: dict) -> list[
         blocks.append("📝 *Summary*\n" + notes["tldr"])
     if notes.get("takeaways"):
         blocks.append("⭐ *Key takeaways*\n" + "\n".join(f"• {t}" for t in notes["takeaways"]))
+    if notes.get("gaps"):
+        blocks.append("⚠️ I couldn't process some parts of the video (around " + ", ".join(fmt_ts(g) for g in notes["gaps"][:8])
+                      + "). Those minutes are missing from the notes - send the link again later to retry.")
     outline = "\n".join(f"{i}. [{fmt_ts(s['start'])}] {s['title']}" for i, s in enumerate(notes["sections"], 1))
     blocks.append("🗂 *Outline*\n" + outline)
     return _pack(blocks)
@@ -572,6 +654,9 @@ def build_pdf(video_id: str, meta: dict, notes: dict, info: dict, thumb: bytes |
     else:
         story += title_cell
     story.append(Spacer(1, 6))
+    if notes.get("gaps"):
+        story.append(P("Note: some parts of the video could not be processed (around " +
+                       ", ".join(fmt_ts(g) for g in notes["gaps"][:8]) + ") and are missing from these notes.", "meta"))
 
     def box(flow_items):
         t = Table([[flow_items]], colWidths=[None])
@@ -751,19 +836,37 @@ async def _run(phone: str, vid: str, say) -> None:
         meta = await asyncio.to_thread(fetch_meta, vid)
         info, notes = {}, None
         try:
-            tr = await asyncio.to_thread(fetch_transcript, vid)
+            mode = translate_mode()
+            tr = await asyncio.to_thread(fetch_transcript, vid, mode == "youtube")
             info = {"lang": tr["lang"], "lang_name": tr["lang_name"], "duration": tr["duration"], "generated": tr["generated"]}
             if tr["duration"] > MAX_MINUTES * 60:
                 raise NotesError(f"That video is {fmt_ts(tr['duration'])} long. I can handle videos up to {MAX_MINUTES // 60}h{MAX_MINUTES % 60:02d}m.")
             windows = build_windows(tr["snippets"])
             if not _is_english(tr["lang"]):
-                await say(f"🌐 The video is in *{tr['lang_name']}*. Translating to English, then writing the notes (this can take a minute or two)...")
-                windows, failed = await asyncio.to_thread(translate_windows, windows, tr["lang_name"])
-                if failed:
-                    log.warning("%d/%d windows left untranslated", failed, len(windows))
+                if tr.get("translated"):            # YouTube already gave English captions: no AI translation needed
+                    meta = {**meta, "lang_note": f"(The transcript was machine-translated from {tr['lang_name']} by YouTube; "
+                                                 "fix obvious translation errors from context.)\n"}
+                    await say(f"🌐 The video is in *{tr['lang_name']}*. Using YouTube's English translation and writing the notes (this can take a minute or two)...")
+                elif mode == "llm":
+                    await say(f"🌐 The video is in *{tr['lang_name']}*. Translating to English, then writing the notes (this can take a minute or two)...")
+                    windows, failed = await asyncio.to_thread(translate_windows, windows, tr["lang_name"])
+                    if failed:
+                        log.warning("%d/%d windows left untranslated", failed, len(windows))
+                else:                               # the notes model translates while it writes (no extra calls)
+                    meta = {**meta, "lang_note": f"(The transcript is in {tr['lang_name']}: write the notes in English.)\n"}
+                    await say(f"🌐 The video is in *{tr['lang_name']}*. Writing the notes in English (this can take a minute or two)...")
             else:
                 await say(f"✍️ Writing point-wise notes for *{meta['title'][:80]}* ({fmt_ts(tr['duration'])}). This can take a minute or two...")
-            notes = await asyncio.to_thread(build_notes, windows, meta)
+            if len(windows) >= 5:
+                est = max(2, round(len(windows) / WORKERS * 0.8))
+                await say(f"⏱ This is a long video ({fmt_ts(tr['duration'])}), so I'm processing it in {len(windows)} parts - roughly {est}-{est * 2} minutes. I'll keep you posted.")
+            loop = asyncio.get_running_loop()
+            marks = {math.ceil(len(windows) * f) for f in (0.25, 0.5, 0.75)} if len(windows) >= 4 else set()
+
+            def progress(n, total):
+                if n in marks:
+                    asyncio.run_coroutine_threadsafe(say(f"📚 Notes progress: {n}/{total} parts done..."), loop)
+            notes = await asyncio.to_thread(build_notes, windows, meta, progress)
         except TranscriptUnavailable as e:
             log.warning("transcript unavailable for %s: %s", vid, e)
             reason = {"blocked": "YouTube blocked the transcript request from my server",
@@ -808,9 +911,9 @@ if __name__ == "__main__":  # pragma: no cover
         print("usage: python notes_utube.py <youtube link>   (writes notes.pdf; needs network + AI keys)")
         raise SystemExit(1)
     v = extract_video_id(sys.argv[1]) or sys.argv[1]
-    m = fetch_meta(v); tr = fetch_transcript(v)
+    m = fetch_meta(v); tr = fetch_transcript(v, translate_mode() == "youtube")
     w = build_windows(tr["snippets"])
-    if not _is_english(tr["lang"]):
+    if not _is_english(tr["lang"]) and not tr.get("translated") and translate_mode() == "llm":
         w, _ = translate_windows(w, tr["lang_name"])
     n = build_notes(w, m)
     open("notes.pdf", "wb").write(build_pdf(v, m, n, {"lang": tr["lang"], "lang_name": tr["lang_name"], "duration": tr["duration"]}, fetch_thumbnail(v)))
