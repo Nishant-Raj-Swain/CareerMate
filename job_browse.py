@@ -52,6 +52,9 @@ MENU_CACHE = 12 * 3600
 PAGE_CACHE = float(os.getenv("JOBS_CACHE_MINUTES", "30")) * 60
 PAGE_LIMIT = 30                 # the site's own page size (?limit=30&offset=N)
 SHOW = 10                       # jobs per WhatsApp message batch
+DETAIL_CACHE = 24 * 3600
+APPLY_LINKS = os.getenv("JOBS_APPLY_LINKS", "1") != "0"       # open each job page to find the employer's own apply link
+SHOW_SOURCE_LINK = os.getenv("JOBS_SHOW_SOURCE_LINK", "1") != "0"   # when no direct link is public, still show the source page
 WA_LIMIT = 3800
 MODE = "job_browse"
 EXIT_WORDS = {"exit", "quit", "cancel", "stop", "/exit", "/cancel"}
@@ -78,6 +81,11 @@ KNOWN = {
 }
 _SKIP_LABEL = re.compile(r"(login|log in|register|sign ?up|post a (job|free)|employer|premium|sales|contact|about|"
                          r"privacy|terms|download|app store|google play|^other\b|\.\.\.$|…$)", re.I)
+
+
+# A real section's links look like job pages (".../jobs-in-pune/123", ".../it-software-job-vacancies").
+# When the links stop looking like that (Placement Papers, company names, login, footer...) the section is over.
+_JOBLIKE = re.compile(r"(^|[/_-])jobs?([/_.-]|$)|vacanc|categor", re.I)
 
 
 class JobsError(Exception):
@@ -195,7 +203,7 @@ def discover_menu(html: str, page_url: str = "") -> dict[str, list[dict]]:
             t = str(node).strip()
             if 3 <= len(t) <= 40:
                 for s in SECTIONS:
-                    if s["heading"].search(t):
+                    if s["heading"].search(t) and not out[s["key"]]:
                         current = s["key"]
                         break
             continue
@@ -212,6 +220,10 @@ def discover_menu(html: str, page_url: str = "") -> dict[str, list[dict]]:
         if p.netloc and not _same_site(p.netloc):
             continue
         if url.rstrip("/") == BASE or url in seen[current] or len(out[current]) >= 80:
+            continue
+        if not _JOBLIKE.search(p.path or ""):
+            if len(out[current]) >= 3:               # we have walked past the end of this menu
+                current = None
             continue
         seen[current].add(url)
         out[current].append({"name": name, "url": url})
@@ -241,25 +253,44 @@ async def get_menu() -> dict[str, list[dict]]:
 _EXP = re.compile(r"^\d+(\.\d+)?(\s*(to|-)\s*\d+(\.\d+)?)?\s*(years?|yrs?|months?)\b", re.I)
 _SAL = re.compile(r"(monthly|yearly|per month|per annum|lpa|p\.?a\.?\b|not disclosed|as per)", re.I)
 _AGO = re.compile(r"(\bago\b|^today$|^just now$|^yesterday$)", re.I)
-_NOISE = re.compile(r"^(apply( now)?|quick apply|view( details| job)?|save|share|walk-?in|new|premium|hot|"
-                    r"jobs? opening|read more|more|details|logo)$", re.I)
-_JOB_HREF = re.compile(r"/jobs/[^/?#]+-\d{3,}/?$", re.I)
+# buttons, badges and toggles that sit inside a job card (never a title / company / location)
+_NOISE = re.compile(r"^(apply( now| here)?|quick apply|view( & | and )?(apply|details|job|more)?|save|saved|share|walk-?in|new|"
+                    r"premium|hot( job)?|urgent|featured|verified|less|more|read (more|less)|show (more|less)|details|logo|"
+                    r"jobs? opening|top|\+\s*\d+|\d+\s*(openings?|vacanc\w+)|work from home|remote|report|whatsapp|"
+                    r"login|register|job alert|get alerts?)$", re.I)
+_CTA = re.compile(r"^(apply|quick apply|view|save|share|read more|more|details)\b", re.I)
+# job page: /jobs/<slug>-<id>  (query string / trailing slash allowed: ?src=..., /)
+_JOB_HREF = re.compile(r"/jobs/[^/?#]+-\d{3,}/?(?:[?#].*)?$", re.I)
+
+
+def _canon(url: str) -> str:
+    return re.sub(r"[?#].*$", "", url).rstrip("/")
 
 
 def _title_clean(t: str) -> str:
-    t = re.sub(r"\s*Jobs?\s*Opening\b.*$", "", t, flags=re.I).strip(" -|")
+    t = re.sub(r"\s*Jobs?\s*Opening\b.*$", "", t, flags=re.I).strip(" -|,")
     return t or "Job opening"
 
 
-def _card_for(a: Tag, all_hrefs: set[str]) -> Tag:
-    """The smallest ancestor that holds this job's details but no other job's title link."""
+def _slug_fields(url: str) -> dict:
+    """Title / company / place from the job URL itself:  <title>-jobs-opening-in-<company>-at-<place>-<id>."""
+    slug = re.sub(r"-\d{3,}$", "", _canon(url).rsplit("/", 1)[-1])
+    ti = lambda x: " ".join(w.capitalize() for w in x.split("-") if w)
+    m = re.match(r"(.+?)-jobs?-opening-in-(.+?)(?:-at-(.+))?$", slug)
+    if m:
+        return {"title": ti(m.group(1)), "company": ti(m.group(2)), "location": ti(m.group(3) or "")}
+    return {"title": ti(re.sub(r"-jobs?-opening.*$", "", slug)), "company": "", "location": ""}
+
+
+def _card_for(a: Tag, own: str) -> Tag:
+    """The smallest ancestor that holds this job's details but no OTHER job's link."""
     best, node = a, a
-    for _ in range(6):
+    for _ in range(7):
         node = node.parent
         if not isinstance(node, Tag) or node.name in ("body", "html"):
             break
-        others = {x.get("href") for x in node.find_all("a", href=True) if _JOB_HREF.search(x.get("href", ""))}
-        if len(others - {a.get("href")}) > 0:
+        others = {_canon(x.get("href", "")) for x in node.find_all("a", href=True) if _JOB_HREF.search(x.get("href", ""))}
+        if others - {own}:
             break
         best = node
     return best
@@ -267,27 +298,94 @@ def _card_for(a: Tag, all_hrefs: set[str]) -> Tag:
 
 def parse_jobs(html: str, page_url: str = "") -> list[dict]:
     soup = BeautifulSoup(html, "lxml")
-    anchors, seen = [], set()
+    groups: dict[str, list[Tag]] = {}                     # one job = one URL, whatever number of links point to it
     for a in soup.find_all("a", href=True):
-        href = a["href"].split("#")[0]
-        if _JOB_HREF.search(href) and _label(a):
-            full = urljoin(page_url or BASE + "/", href)
-            if full not in seen:
-                seen.add(full); anchors.append((a, full))
-    hrefs = {a.get("href") for a, _ in anchors}
+        if _JOB_HREF.search(a["href"]):
+            groups.setdefault(_canon(urljoin(page_url or BASE + "/", a["href"].split("#")[0])), []).append(a)
     jobs = []
-    for a, full in anchors:
-        title_raw = _label(a)
-        card = _card_for(a, hrefs)
+    for full, anchors in groups.items():
+        own = _canon(anchors[0]["href"])                  # raw form, same as _card_for compares
+        card = _card_for(anchors[0], own)
+        # anything holding an OTHER job's link is not a card: if the climb overshot, fall back to the link's own parent
         lines = [re.sub(r"\s+", " ", ln).strip() for ln in card.get_text("\n").split("\n")]
-        lines = [ln for ln in lines if ln and ln != title_raw and not _NOISE.match(ln) and len(ln) < 120]
-        exp = next((ln for ln in lines if _EXP.match(ln)), "")
-        sal = next((ln for ln in lines if _SAL.search(ln) and re.search(r"\d|disclosed|as per", ln, re.I)), "")
-        ago = next((ln for ln in lines if _AGO.search(ln)), "")
-        rest = [ln for ln in lines if ln not in (exp, sal, ago) and not re.match(r"^(experience|salary|posted)\b", ln, re.I)]
-        jobs.append({"title": _title_clean(title_raw), "company": rest[0] if rest else "",
-                     "location": rest[1] if len(rest) > 1 else "", "exp": exp, "salary": sal, "posted": ago, "url": full})
+        lines = [ln for ln in lines if ln and len(ln) < 140]
+        # title: the line saying "... Jobs Opening", else the label of a non-button link
+        ti = next((i for i, ln in enumerate(lines) if re.search(r"jobs?\s*opening", ln, re.I)), None)
+        title_raw = lines[ti] if ti is not None else next((_label(a) for a in anchors if _label(a) and not _CTA.match(_label(a))), "")
+        after = lines[ti + 1:] if ti is not None else [ln for ln in lines if ln != title_raw]
+        after = [ln for ln in after if not _NOISE.match(ln) and ln != title_raw]
+        exp = next((ln for ln in after if _EXP.match(ln)), "")
+        sal = next((ln for ln in after if _SAL.search(ln) and re.search(r"\d|disclosed|as per", ln, re.I)), "")
+        ago = next((ln for ln in after if _AGO.search(ln)), "")
+        rest = [ln for ln in after if ln not in (exp, sal, ago) and not re.match(r"^(experience|salary|posted|apply)\b", ln, re.I)]
+        sf = _slug_fields(full)
+        title = _title_clean(title_raw) if title_raw and not _CTA.match(title_raw) else sf["title"]
+        company = rest[0] if rest else sf["company"]
+        location = rest[1] if len(rest) > 1 else sf["location"]
+        jobs.append({"title": title, "company": company, "location": location, "exp": exp, "salary": sal, "posted": ago, "url": full})
     return jobs
+
+
+_SOCIAL = re.compile(r"(facebook|twitter|x\.com|linkedin\.com/(share|sharing)|instagram|youtube|youtu\.be|whatsapp|wa\.me|t\.me|telegram|"
+                     r"pinterest|play\.google|apps\.apple|itunes|google\.com|bit\.ly|goo\.gl|mailto:)", re.I)
+_APPLY_TEXT = re.compile(r"(apply|career|company (web)?site|official (web)?site|visit (the )?(company|website)|click here|job (link|page))", re.I)
+_APPLY_HREF = re.compile(r"(apply|career|recruit|hiring|opening|vacanc|jobs?\b|join|talent|workday|lever\.co|greenhouse|naukri|forms\.)", re.I)
+_EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
+
+
+def parse_apply(html: str, page_url: str = "") -> dict:
+    """The employer's own way to apply, if the job page shows one to any visitor:
+    an external apply/careers link, or an e-mail address. Never reads anything behind a login."""
+    soup = BeautifulSoup(html, "lxml")
+    for t in soup(["script", "style", "noscript"]):
+        t.decompose()
+    best, best_score = "", 0
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
+        if href.startswith(("#", "javascript:", "tel:", "mailto:")):
+            continue
+        url = urljoin(page_url or BASE + "/", href)
+        host = urlparse(url).netloc
+        if not host or _same_site(host) or _SOCIAL.search(url):
+            continue                                    # the source site's own pages / redirects / social links
+        txt = _label(a)
+        score = (2 if _APPLY_TEXT.search(txt) else 0) + (1 if _APPLY_HREF.search(url) else 0)
+        if score > best_score:
+            best, best_score = url, score
+    email = ""
+    text = soup.get_text(" ", strip=True)
+    for m in _EMAIL.finditer(text):
+        e = m.group(0)
+        if not _same_site(e.split("@")[1]) and not re.search(r"(example\.|noreply|no-reply|support@|info@freshers)", e, re.I):
+            email = e
+            break
+    for a in soup.find_all("a", href=True):          # explicit mailto: links count too
+        if a["href"].lower().startswith("mailto:") and not email:
+            e = a["href"][7:].split("?")[0].strip()
+            if _EMAIL.fullmatch(e) and not _same_site(e.split("@")[1]):
+                email = e
+    return {"apply": best if best_score >= 2 else "", "email": email}
+
+
+async def enrich_apply(jobs: list[dict], budget: float = 60.0) -> None:
+    """Fills job['apply'] / job['email'] by opening each job's own page (cached 24 h). Failures just leave it empty."""
+    if not APPLY_LINKS:
+        return
+    t0 = time.time()
+    for j in jobs:
+        if "apply" in j:
+            continue
+        if time.time() - t0 > budget:
+            break
+        hit = _cached("apply:" + j["url"], DETAIL_CACHE)
+        if hit is None:
+            try:
+                html = await _get(j["url"], DETAIL_CACHE)
+                hit = _store("apply:" + j["url"], await asyncio.to_thread(parse_apply, html, j["url"]))
+            except JobsError as e:
+                log.info("job page not read (%s): %s", j["url"], e)
+                continue
+        j["apply"], j["email"] = hit["apply"], hit["email"]
 
 
 def _page_url(url: str, offset: int) -> str:
@@ -320,7 +418,12 @@ def _job_text(n: int, j: dict) -> str:
                                    j["posted"] and f"🕒 {j['posted']}") if x)
     if extra:
         lines.append(extra)
-    lines.append(f"🔗 {j['url']}")
+    if j.get("apply"):
+        lines.append(f"✅ Apply: {j['apply']}")
+    if j.get("email"):
+        lines.append(f"📧 Send your resume to: {j['email']}")
+    if not j.get("apply") and not j.get("email") and SHOW_SOURCE_LINK:
+        lines.append(f"🔗 Job page: {j['url']}")            # no public direct link: the source page is all there is
     return "\n".join(lines)
 
 
@@ -405,7 +508,7 @@ async def _open_section(phone: str, idx: int):
     return _list_msgs(sec, items)
 
 
-async def _show_jobs(phone: str, state: dict, item: dict):
+async def _show_jobs(phone: str, state: dict, item: dict, notify=None):
     """First page of jobs for a chosen category / qualification / city."""
     try:
         jobs = await get_jobs(item["url"], 0)
@@ -416,10 +519,10 @@ async def _show_jobs(phone: str, state: dict, item: dict):
         return ["😕 I couldn't read any jobs for *%s* right now. Please pick another from the list, *back* or *exit*." % item["name"]]
     st = {"mode": MODE, "step": "jobs", "section": state.get("section"), "items": state.get("items"),
           "item": item, "offset": 0, "shown": 0}
-    return await _more(phone, st, first=True)
+    return await _more(phone, st, first=True, notify=notify)
 
 
-async def _more(phone: str, st: dict, first: bool = False):
+async def _more(phone: str, st: dict, first: bool = False, notify=None):
     item, offset, shown = st["item"], int(st.get("offset", 0)), int(st.get("shown", 0))
     jobs = await get_jobs(item["url"], offset)
     if shown >= len(jobs):                           # this page is used up: next page of the site
@@ -433,6 +536,9 @@ async def _more(phone: str, st: dict, first: bool = False):
             return ["That's all the jobs I can see for *%s*. Reply with another name/number, *back*, or *exit*." % item["name"]]
         offset, shown, jobs = offset + PAGE_LIMIT, 0, nxt
     batch = jobs[shown:shown + SHOW]
+    if APPLY_LINKS and notify and any("apply" not in j for j in batch):
+        await notify("🔎 Finding the direct apply links (about %d seconds)..." % max(5, int(len(batch) * (DELAY + 0.6))))
+    await enrich_apply(batch)
     base_n = offset + shown
     head = f"🎯 *{item['name']}* - jobs {base_n + 1}-{base_n + len(batch)}\n\n" if first or shown == 0 else \
         f"🎯 *{item['name']}* - jobs {base_n + 1}-{base_n + len(batch)}\n\n"
@@ -468,7 +574,7 @@ async def reply(phone: str, text: str, notify=None):
                     return await _open_section(phone, i), False
             return ["🤔 Please reply with *1*, *2*, *3* or *4* (or *exit*).", _sections_text()], False
         if step == "jobs" and low in ("more", "next", "m", "n"):
-            return await _more(phone, state), False
+            return await _more(phone, state, notify=notify), False
         if low in ("more", "next", "m", "n"):
             return ["That's the end of this list. Reply with another number/name, *back* for the sections, or *exit*."], False
         items = state.get("items") or []
@@ -477,7 +583,7 @@ async def reply(phone: str, text: str, notify=None):
             return [f"🤔 I didn't find that. Reply with a number from 1 to {len(items)}, a name from the list, *back* or *exit*."], False
         if notify:
             await notify(f"⏳ Fetching jobs for *{item['name']}*...")
-        return await _show_jobs(phone, state, item), False
+        return await _show_jobs(phone, state, item, notify), False
     except Exception:
         log.exception("job_browse.reply failed")
         return ["⚠️ Something went wrong while loading jobs. Please try again, or use */job_search <role>*."], False
@@ -494,8 +600,20 @@ async def _cli(argv):  # pragma: no cover
     elif len(argv) >= 3 and argv[1] == "jobs":
         for i, j in enumerate(await get_jobs(argv[2]), 1):
             print(i, j)
+    elif len(argv) >= 3 and argv[1] == "debug":       # raw structure of the first jobs: paste this output to get the parser fixed
+        html = await _get(argv[2], 0)
+        open("job_page_debug.html", "w", encoding="utf-8").write(html)
+        soup = BeautifulSoup(html, "lxml")
+        links = [a for a in soup.find_all("a", href=True) if _JOB_HREF.search(a["href"])]
+        print(f"saved job_page_debug.html ({len(html)} bytes); job-like links: {len(links)}; unique: {len({_canon(a['href']) for a in links})}")
+        for a in links[:4]:
+            card = _card_for(a, _canon(a["href"]))
+            print("\n--- link:", repr(_label(a)), a["href"][:110])
+            print("    card <%s class=%r>, lines:" % (card.name, " ".join(card.get("class", []))[:60]))
+            for ln in [x.strip() for x in card.get_text("\n").split("\n") if x.strip()][:14]:
+                print("      |", ln[:100])
     else:
-        print('usage: python job_browse.py menu | jobs "<listing url>"')
+        print('usage: python job_browse.py menu | jobs "<listing url>" | debug "<listing url>"')
 
 
 if __name__ == "__main__":  # pragma: no cover
