@@ -313,7 +313,7 @@ SECTION_SYSTEM = """You turn video transcripts into excellent study notes for a 
 Return ONLY one JSON object:
 {"sections":[{"title":"...","start":"m:ss","points":["..." or {"p":"...","sub":["...","..."]}],"terms":[{"term":"...","meaning":"..."}]}]}
 Rules:
-- Make 1-4 sections for the text given, each a distinct topic in the order spoken. "start" must be copied from the nearest [m:ss] marker where that topic begins.
+- Make 2-5 sections for the text given (one per distinct topic, roughly one per 3-5 minutes of speech), in the order spoken. "start" must be copied from the nearest [m:ss] marker where that topic begins.
 - title: 3-8 words, specific (never "Introduction part 2").
 - points: 4-10 per section. Each point is a complete, self-contained statement (not a fragment): the idea, the reason or mechanism behind it, and any number, formula, step, example, name or code the speaker gave. Use "sub" bullets for steps, lists or examples that belong to a point.
 - Keep the speaker's facts exactly; never invent facts or add outside knowledge. Skip greetings, sponsor reads, "like and subscribe" and filler.
@@ -322,8 +322,14 @@ Rules:
 
 OVERVIEW_SYSTEM = """You write the front page of a study-notes document from the section notes of one video.
 Return ONLY one JSON object:
-{"subject":"2-5 word topic label","tldr":"2-4 sentence summary of the whole video","takeaways":["..."],"questions":[{"q":"...","a":"..."}]}
-Rules: takeaways = 5-8 of the most important, concrete points a learner must remember (full sentences). questions = 5 revision questions that test understanding of the notes (not trivia), with short correct answers taken from the notes. Plain text only. Use only the provided notes."""
+{"subject":"2-5 word topic label","tldr":"a 4-6 sentence summary of the whole video: what it teaches, how it is organised, what the learner can do afterwards","takeaways":["..."],"insights":[{"t":"short title","d":"2-3 sentences: the idea, why it matters, an example from the video"}],"questions":[{"q":"...","a":"..."}]}
+Rules: takeaways = 6-8 of the most important, concrete points a learner must remember (full sentences). insights = 5-7 deeper ideas, trade-offs or common mistakes the speaker explained. questions = 5 revision questions that test understanding of the notes (not trivia), with short correct answers taken from the notes. Plain text only. Use only the provided notes."""
+
+
+COMBINED_SYSTEM = SECTION_SYSTEM.replace(
+    '{"sections":', '{"subject":"2-5 word topic","tldr":"4-6 sentences","takeaways":["6-8 key points"],'
+    '"insights":[{"t":"short title","d":"2-3 sentences"}],"questions":[{"q":"...","a":"..."}],"sections":') + \
+    "\n- Also give 5 revision questions with short answers, 5-7 insights and 6-8 takeaways."
 
 
 def _clean_points(raw) -> list:
@@ -388,7 +394,7 @@ def build_notes(windows: list[dict], meta: dict, progress=None) -> dict:
         user = (f"Video title: {meta.get('title', '')}\nChannel: {meta.get('channel', '')}\n"
                 f"{meta.get('lang_note', '')}\nTRANSCRIPT:\n{windows[0]['text']}")
         try:
-            one = _notes_from_json(_json_call(VIDEO_SYSTEM, user, max_tokens=6000) or {})
+            one = _notes_from_json(_json_call(COMBINED_SYSTEM, user, max_tokens=6000) or {})
         except Exception as e:
             log.warning("single-call notes failed, using the normal path: %s", e)
             one = None
@@ -414,6 +420,16 @@ def build_notes(windows: list[dict], meta: dict, progress=None) -> dict:
         results = list(ex.map(work, windows))
     gaps = [int(w["start"]) for w, secs, ok in results if not ok]
     sections = [s for _, secs, _ in results for s in secs]
+    return _assemble(sections, gaps, meta)
+
+
+def _insights(raw) -> list[dict]:
+    return [{"t": str(i.get("t", "")).strip(), "d": str(i.get("d", "")).strip()}
+            for i in (raw or []) if isinstance(i, dict) and i.get("t") and i.get("d")][:8]
+
+
+def _assemble(sections: list[dict], gaps: list[int], meta: dict) -> dict:
+    """Sections from any source -> final notes (one overview call: summary, takeaways, insights, questions)."""
     if not sections:
         raise NotesError("I couldn't generate notes for this video right now (the AI service is busy or unavailable). Please try again in a few minutes.")
     sections.sort(key=lambda s: s["start"])
@@ -425,7 +441,7 @@ def build_notes(windows: list[dict], meta: dict, progress=None) -> dict:
         head = f"- [{fmt_ts(s['start'])}] {s['title']}"
         lines.append(head + (": " + " | ".join(p["p"] for p in s["points"][:3])[:per] if per >= 80 else ""))
     try:
-        ov = _json_call(OVERVIEW_SYSTEM, f"Video: {meta.get('title', '')}\n\nSECTION NOTES:\n" + "\n".join(lines), max_tokens=2500) or {}
+        ov = _json_call(OVERVIEW_SYSTEM, f"Video: {meta.get('title', '')}\n\nSECTION NOTES:\n" + "\n".join(lines), max_tokens=3500) or {}
     except Exception as e:                       # the notes are the product; a missing front page is not fatal
         log.warning("overview call failed: %s", e)
         ov = {}
@@ -439,6 +455,7 @@ def build_notes(windows: list[dict], meta: dict, progress=None) -> dict:
         "subject": str(ov.get("subject") or "").strip(),
         "tldr": str(ov.get("tldr") or "").strip(),
         "takeaways": [str(x).strip() for x in (ov.get("takeaways") or []) if str(x).strip()][:8],
+        "insights": _insights(ov.get("insights")),
         "questions": [{"q": str(q.get("q", "")).strip(), "a": str(q.get("a", "")).strip()}
                       for q in (ov.get("questions") or []) if isinstance(q, dict) and q.get("q") and q.get("a")][:6],
         "sections": sections,
@@ -448,34 +465,86 @@ def build_notes(windows: list[dict], meta: dict, progress=None) -> dict:
 
 
 # --------------------------------------------- fallback: Gemini watches the video
-VIDEO_SYSTEM = SECTION_SYSTEM.replace("for the text given", "for the whole video").replace(
-    '{"sections":', '{"subject":"2-5 word topic","tldr":"2-4 sentences","takeaways":["5-8 key points"],'
-    '"questions":[{"q":"...","a":"..."}],"sections":') + \
-    "\n- Cover the entire video from start to end (about 1 section per 5-8 minutes). Add 5 revision questions with short answers."
+VIDEO_CHUNK_SECONDS = int(os.getenv("NOTES_VIDEO_CHUNK_SECONDS", "1200"))     # one Gemini call per 20 minutes of video
+VIDEO_SYSTEM = """You turn a video clip into detailed study notes for a student who has NOT watched it.
+Return ONLY one JSON object:
+{"sections":[{"title":"...","start":"m:ss","points":["..." or {"p":"...","sub":["...","..."]}],"terms":[{"term":"...","meaning":"..."}]}]}
+Rules:
+- The clip is a slice of a longer video. "start" is the time where the topic begins, counted from the START OF THIS CLIP as m:ss (the clip's first second is 0:00).
+- Cover the clip completely, from its first to its last minute: make one section per 3-5 minutes of the clip (a 20-minute clip needs 4-7 sections), in the order spoken. Never compress a long clip into a few sections.
+- title: 3-8 words, specific. points: 5-9 per section, each a complete self-contained statement: the idea, the reason behind it, and any number, formula, step, example, name or code shown or said. Use "sub" bullets for steps and examples. Include what is written on slides or code on screen when it matters.
+- Never invent facts. Skip greetings, sponsor reads, "like and subscribe" and filler. terms: 0-5 important technical terms with a one-sentence meaning.
+- Write in clear English even if the speech is in another language. Plain text only: no markdown, no emojis.
+- If the clip contains no speech or content, return {"sections":[]}."""
 
 
-def notes_from_video_url(video_id: str) -> dict:
-    """Gemini ingests the public YouTube URL itself (audio + visuals), so no transcript / IP block is involved."""
-    key = chat_pdf._gemini_key()
-    if not key or _env("NOTES_GEMINI_VIDEO", "1") == "0":
-        raise NotesError("no-video-fallback")
-    model = chat_pdf._gemini_model()
+def _video_chunk(video_id: str, key: str, model: str, i: int) -> list[dict]:
+    a, b = i * VIDEO_CHUNK_SECONDS, (i + 1) * VIDEO_CHUNK_SECONDS
     body = {"contents": [{"role": "user", "parts": [
-        {"file_data": {"file_uri": f"https://www.youtube.com/watch?v={video_id}"}},
-        {"text": "Create the study notes for this video as instructed."}]}],
+        {"file_data": {"file_uri": f"https://www.youtube.com/watch?v={video_id}"},
+         "video_metadata": {"start_offset": f"{a}s", "end_offset": f"{b}s"}},
+        {"text": "Write the study notes for this clip as instructed."}]}],
         "systemInstruction": {"parts": [{"text": VIDEO_SYSTEM}]},
-        "generationConfig": {"maxOutputTokens": 16384, "responseMimeType": "application/json",
+        "generationConfig": {"maxOutputTokens": 12000, "responseMimeType": "application/json",
                              "mediaResolution": "MEDIA_RESOLUTION_LOW"}}
     url = f"{chat_pdf._gemini_base()}/v1beta/models/{model}:generateContent"
     data = chat_pdf._post(url, {"x-goog-api-key": key, "Content-Type": "application/json"}, body, timeout=600, retries=1)
     try:
         text = "".join(p.get("text", "") for p in data["candidates"][0]["content"]["parts"] if not p.get("thought"))
     except (KeyError, IndexError, TypeError):
+        return []
+    secs = _clean_sections(_parse_json(text) or {})
+    for s in secs:
+        # timestamps are relative to the clip; if the model answered with absolute times already, keep them
+        s["start"] = s["start"] + a if (s["start"] < VIDEO_CHUNK_SECONDS or i == 0) else s["start"]
+    return secs
+
+
+def notes_from_video_url(video_id: str, meta: dict | None = None, progress=None) -> dict:
+    """Gemini ingests the public YouTube URL itself (audio + visuals), so no transcript / IP block is involved.
+    The video is read in 20-minute slices (so a 2-hour video gets as much detail as a short one); the end of the
+    video is found when a slice comes back empty or past the end."""
+    key = chat_pdf._gemini_key()
+    if not key or _env("NOTES_GEMINI_VIDEO", "1") == "0":
         raise NotesError("no-video-fallback")
-    notes = _notes_from_json(_parse_json(text) or {})
-    if not notes:
+    model = chat_pdf._gemini_model()
+    max_chunks = max(1, math.ceil(MAX_MINUTES * 60 / VIDEO_CHUNK_SECONDS))
+    sections, gaps, i, ended = [], [], 0, False
+    while i < max_chunks and not ended:
+        batch = list(range(i, min(max_chunks, i + WORKERS)))
+
+        def one(idx):
+            for attempt in range(2):
+                try:
+                    return idx, _video_chunk(video_id, key, model, idx), None
+                except Exception as e:
+                    err = e
+                    time.sleep(2.0)
+            return idx, [], err
+        with ThreadPoolExecutor(max_workers=WORKERS) as ex:
+            results = list(ex.map(one, batch))
+        for idx, secs, err in sorted(results, key=lambda r: r[0]):
+            if ended:
+                break
+            if err is not None:
+                if idx > 0 and "HTTP 400" in str(err):       # asked for minutes past the end of the video
+                    ended = True
+                else:
+                    log.warning("video slice %d failed: %s", idx, err)
+                    gaps.append(idx * VIDEO_CHUNK_SECONDS)
+            elif not secs and idx > 0:
+                ended = True
+            else:
+                sections += secs
+        if progress:
+            try:
+                progress(len(sections))
+            except Exception:
+                pass
+        i += len(batch)
+    if not sections:
         raise NotesError("no-video-fallback")
-    return notes
+    return _assemble(sections, gaps, meta or {"title": ""})
 
 
 def _notes_from_json(j: dict) -> dict | None:
@@ -490,6 +559,7 @@ def _notes_from_json(j: dict) -> dict | None:
                 seen.add(t["term"].lower()); gloss.append(t)
     return {"subject": str(j.get("subject") or "").strip(), "tldr": str(j.get("tldr") or "").strip(),
             "takeaways": [str(x).strip() for x in (j.get("takeaways") or []) if str(x).strip()][:8],
+            "insights": _insights(j.get("insights")),
             "questions": [{"q": str(q.get("q", "")).strip(), "a": str(q.get("a", "")).strip()}
                           for q in (j.get("questions") or []) if isinstance(q, dict) and q.get("q") and q.get("a")][:6],
             "sections": sorted(sections, key=lambda s: s["start"]), "glossary": gloss[:30]}
@@ -668,6 +738,10 @@ def build_pdf(video_id: str, meta: dict, notes: dict, info: dict, thumb: bytes |
         story += [P("Summary", "h1"), box([P(notes["tldr"], "body")])]
     if notes.get("takeaways"):
         story += [P("Key takeaways", "h1"), box([bullet(t) for t in notes["takeaways"]])]
+    if notes.get("insights"):
+        story.append(P("Key insights", "h1"))
+        for ins in notes["insights"]:
+            story.append(KeepTogether([P(ins["t"], "q"), P(ins["d"], "a")]))
     story.append(P("Detailed notes", "h1"))
     for i, s in enumerate(notes["sections"], 1):
         heading = _pdf_text("%d. %s" % (i, s["title"]))
@@ -875,7 +949,7 @@ async def _run(phone: str, vid: str, say) -> None:
                 raise NotesError("I can't access that video - it may be private, age-restricted or removed.")
             await say(f"ℹ️ {reason[0].upper() + reason[1:]}, so I'll try listening to the video itself. This takes a bit longer...")
             try:
-                notes = await asyncio.to_thread(notes_from_video_url, vid)
+                notes = await asyncio.to_thread(notes_from_video_url, vid, meta)
                 info = {}
             except NotesError:
                 raise NotesError(f"I couldn't get the transcript ({reason}). Try a video that has captions, or try again later.")
@@ -894,19 +968,57 @@ async def _run(phone: str, vid: str, say) -> None:
             log.info("thumbnail not sent: %s", e)
     for m in render_whatsapp(vid, meta, notes, info):
         await say(m)
+    pdf, why = None, ""
     try:
         pdf = await asyncio.to_thread(build_pdf, vid, meta, notes, info, thumb)
-        await send_pdf(phone, pdf, _safe_filename(meta["title"]), "📄 Full notes (tap the [timestamps] to jump to that part of the video)")
     except Exception as e:
-        log.exception("PDF step failed: %s", e)
-        await say("📄 I couldn't attach the PDF, so here are the full notes:")
+        log.exception("PDF BUILD failed (is reportlab/pillow installed?): %s", e)
+        why = "PDF could not be built"
+    if pdf:
+        try:
+            await send_pdf(phone, pdf, _safe_filename(meta["title"]), "📄 Full notes (tap the [timestamps] to jump to that part of the video)")
+        except Exception as e:
+            log.exception("PDF SEND failed (WhatsApp media upload): %s", e)
+            pdf, why = None, "PDF could not be uploaded to WhatsApp"
+    if not pdf:
+        await say(f"📄 ({why}) - here are the full notes instead:")
         for m in render_full_text(notes):
             await say(m)
     await say("✅ Done! Send */utube_notes* for another video, or */menu* for the menu.")
 
 
+def selftest() -> None:  # pragma: no cover
+    """python notes_utube.py selftest  -> checks everything the PDF + WhatsApp upload need, on THIS server."""
+    import importlib
+    ok = True
+    for m in ("youtube_transcript_api", "reportlab", "PIL", "requests"):
+        try:
+            importlib.import_module(m); print("OK      module", m)
+        except Exception as e:
+            ok = False; print("MISSING module", m, "->", e, " (pip install youtube-transcript-api reportlab pillow requests)")
+    print("font    ", _fonts()["name"], "(DejaVu = full unicode, Helvetica = ASCII only)")
+    try:
+        sec = [{"title": "Test", "start": 0, "points": [{"p": "A point", "sub": ["a sub point"]}], "terms": []}]
+        pdf = build_pdf("dQw4w9WgXcQ", {"title": "Self test", "channel": "me"}, {"sections": sec, "tldr": "x", "takeaways": ["y"],
+                        "insights": [{"t": "t", "d": "d"}], "questions": [], "glossary": []}, {}, None)
+        print("OK      PDF built,", len(pdf), "bytes")
+    except Exception as e:
+        ok = False; print("FAILED  PDF build:", repr(e))
+    try:
+        base, headers, pid = _graph()
+        r = requests.get(f"{base}/{pid}", headers=headers, params={"fields": "display_phone_number,verified_name"}, timeout=20)
+        print("OK     " if r.status_code == 200 else "FAILED ", "WhatsApp credentials: HTTP", r.status_code, r.text[:160])
+        ok = ok and r.status_code == 200
+    except Exception as e:
+        ok = False; print("FAILED  WhatsApp credentials:", repr(e))
+    print("Gemini key:", "set" if chat_pdf._gemini_key() else "NOT SET (the 'watch the video' fallback needs it)")
+    print("ALL GOOD" if ok else "Fix the lines marked MISSING/FAILED above.")
+
+
 if __name__ == "__main__":  # pragma: no cover
     import sys
+    if len(sys.argv) == 2 and sys.argv[1] == "selftest":
+        selftest(); raise SystemExit(0)
     if len(sys.argv) < 2:
         print("usage: python notes_utube.py <youtube link>   (writes notes.pdf; needs network + AI keys)")
         raise SystemExit(1)
