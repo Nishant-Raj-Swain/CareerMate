@@ -43,6 +43,7 @@ import database as db
 import pdf_service
 import chat_pdf  # NEW: /chat_pdf (RAG over a PDF the user sends)
 import notes_utube  # NEW: /utube_notes (YouTube link -> point-wise notes + PDF)
+import job_browse  # NEW: /job_search menu (category / qualification / city -> jobs)
 import quiz  # NEW: /practice (category -> topic -> 20 random MCQs), same job as quiz_service
 import image_service
 from ai_service import AIService
@@ -208,6 +209,18 @@ async def _practice_output(phone: str, msgs, questions, topic):
     await send_next_question(phone, quiz_state)
 
 
+async def _job_output(phone: str, msgs, want_role: bool):
+    """Sends job-browser messages; option 4 ("type a role") switches to the existing job_search mode."""
+    for m in msgs:
+        await wa.text(phone, m)
+    if want_role:
+        db.save_state(phone, {"mode": "job_search"})
+        await wa.text(phone, "🔍 *Job Search Mode*\n\nPlease reply with the role or domain you are searching for (e.g., Data Analyst, Python Developer).")
+        return
+    if not db.get_user(phone).get("state"):  # menu was closed -> show the main menu
+        await wa.menu(phone)
+
+
 async def handle_text(phone: str, text: str):
     user = db.get_user(phone)
     state = user.get("state", {})
@@ -223,6 +236,12 @@ async def handle_text(phone: str, text: str):
     if mode == notes_utube.MODE:
         if await notes_utube.handle(phone, text, say=lambda m: wa.text(phone, m)):
             await wa.menu(phone)
+        return
+
+    # --- /job_search menu: category / qualification / city -> jobs ---
+    if mode == job_browse.MODE:
+        msgs, want_role = await job_browse.reply(phone, text, notify=lambda m: wa.text(phone, m))
+        await _job_output(phone, msgs, want_role)
         return
 
     # --- PRACTICE MENU (/practice): user is choosing a category / topic ---
@@ -276,7 +295,9 @@ async def handle_text(phone: str, text: str):
             else:
                 opt_labels = ["A", "B", "C", "D", "E"]
                 correct_label = opt_labels[correct_idx] if correct_idx < len(opt_labels) else "N/A"
-                await wa.text(phone, f"❌ *Incorrect.* Correct Answer: *{correct_label}*")
+                why = (current_q.get("explanation") or "").strip()
+                tip = f"\n\n💡 {why[:350]}{'…' if len(why) > 350 else ''}" if why else ""
+                await wa.text(phone, f"❌ *Incorrect.* Correct Answer: *{correct_label}*{tip}")
 
         state["current_index"] = idx + 1
         db.save_state(phone, state)
@@ -487,9 +508,9 @@ async def command(phone: str, text: str):
             analytics.log_event(phone, "job_search", meta={"topic": domain_query})
             await wa.text(phone, job_results)
             await wa.menu(phone)
-        else:
-            db.save_state(phone, {"mode": "job_search"})
-            await wa.text(phone, "🔍 *Job Search Mode*\n\nPlease reply with the role or domain you are searching for (e.g., Data Analyst, Python Developer).")
+        else:  # no argument: browse by category / qualification / city (option 4 = type a role, the old behaviour)
+            msgs, want_role = await job_browse.start(phone, notify=lambda m: wa.text(phone, m))
+            await _job_output(phone, msgs, want_role)
         return
 
     if cmd == "/roadmap":
