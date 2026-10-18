@@ -75,12 +75,30 @@ ALIASES = {"c": "C Programming", "cpp": "C++ Programming", "sql": "SQL", "reason
            "logical": "Verbal Reasoning", "aptitude": "Aptitude", "networking": "Networking", "java": "Java",
            "python": "Python"}
 
+SEEN_PER_USER = 300                                              # remembered questions per user (so quizzes don't repeat)
+_FIGURE = re.compile(r"\b(figure|diagram|pie[- ]chart|bar[- ]graph|line graph|following graph|the image|the picture|shown below|image below)\b", re.I)
+
 LEAF_RE = re.compile(r"/practice-mcq-question-on-[^/]+/?", re.I)       # a topic that has questions
 CATEGORY_RE = re.compile(r"/mcq-question(?:s)?-on-[^/]+/?", re.I)      # a page that lists topics
 
 
 class ScrapeError(Exception):
     pass
+
+
+# ---------------------------------------------------- "don't repeat questions" memory
+from collections import defaultdict, deque
+
+_SEEN: dict[str, deque] = defaultdict(lambda: deque(maxlen=SEEN_PER_USER))
+
+
+def _qkey(question: str) -> str:
+    return re.sub(r"\W+", "", (question or "").lower())[:100]
+
+
+def _mark_seen(phone: str | None, questions: list[dict]) -> None:
+    if phone:
+        _SEEN[phone].extend(_qkey(q["question"]) for q in questions)
 
 
 # ------------------------------------------------------------------ HTTP layer
@@ -516,6 +534,8 @@ def parse_questions(html: str, source: str = "") -> list[dict]:
             stats["too_many_options"] += 1; return
         if idx >= len(q["options"]) or not q["question"] or not all(q["options"]):
             stats["bad"] += 1; return
+        if _FIGURE.search(q["question"]):                          # refers to a picture we cannot show
+            stats["bad"] += 1; return
         key = re.sub(r"\W+", "", q["question"].lower())[:100]
         if key in seen:
             return
@@ -545,8 +565,8 @@ _FIXED_OPTION = re.compile(r"\b(all|none|both|neither)\b.*\b(above|these|them|of
 
 def shuffle_options(q: dict) -> dict:
     """Shuffles option order (and fixes 'correct') unless an option refers to the others."""
-    if any(_FIXED_OPTION.search(o) for o in q["options"]):
-        return q
+    if any(_FIXED_OPTION.search(o) for o in q["options"]) or re.search(r"\boption\s*\(?[A-Ea-e]\b|\([A-Ea-e]\)", q.get("explanation", "")):
+        return q                                  # options refer to each other / the solution quotes a letter: keep the order
     order = list(range(len(q["options"])))
     random.shuffle(order)
     return {**q, "options": [q["options"][i] for i in order], "correct": order.index(q["correct"])}
@@ -639,9 +659,12 @@ async def get_children(url: str) -> dict:
     return _store("children:" + url, res) if res["items"] else res
 
 
-async def get_questions(topic_url: str, total: int = 20, rng: random.Random | None = None) -> list[dict]:
-    """`total` random, shuffled questions from one topic. Different every call."""
+async def get_questions(topic_url: str, total: int = 20, rng: random.Random | None = None,
+                        phone: str | None = None) -> list[dict]:
+    """`total` random, shuffled questions from one topic. Different every call; questions this user saw
+    recently are used only if the topic has too few new ones."""
     rng = rng or random
+    avoid = set(_SEEN[phone]) if phone else set()
     first_html = await _get(topic_url.split("?")[0])
     nav = discover_nav(first_html)
     tried, pool, seen_q = set(), [], set()
@@ -666,7 +689,8 @@ async def get_questions(topic_url: str, total: int = 20, rng: random.Random | No
     for s, p in options[:PAGES_PER_QUIZ]:
         await take(s, p)
     extra = iter(options[PAGES_PER_QUIZ:PAGES_PER_QUIZ + MAX_EXTRA_PAGES])
-    while len(pool) < total:
+    fresh = lambda: sum(1 for q in pool if _qkey(q["question"]) not in avoid)
+    while fresh() < total:
         nxt = next(extra, None)
         if nxt is None:
             break
@@ -674,7 +698,11 @@ async def get_questions(topic_url: str, total: int = 20, rng: random.Random | No
     if not pool:                                     # last resort: the plain topic page
         await take(1, 1)
     rng.shuffle(pool)
-    return [shuffle_options(q) if rng is random else q for q in pool[:total]]
+    pool.sort(key=lambda q: _qkey(q["question"]) in avoid)           # unseen first (stable, keeps the shuffle)
+    picked = pool[:total]
+    rng.shuffle(picked)
+    _mark_seen(phone, picked)
+    return [shuffle_options(q) if rng is random else q for q in picked]
 
 
 
@@ -685,8 +713,26 @@ def _public(q: dict) -> dict:
             "explanation": q.get("explanation", "")}
 
 
-async def fetch_quiz_questions(topic: str = "python", total_needed: int = 20) -> list[dict]:
-    """Same contract as quiz_service.fetch_indiabix_questions: list of dicts, [] on any failure."""
+async def _indiabix_fallback(topic: str, total: int) -> list[dict]:
+    """Last resort when this site cannot be read: your existing quiz_service (if it is importable)."""
+    try:
+        import quiz_service
+        qs = await quiz_service.fetch_indiabix_questions(topic=(topic or "python").lower(), total_needed=total)
+        log.info("quiz fallback to quiz_service for %r: %d questions", topic, len(qs or []))
+        return qs or []
+    except Exception as e:
+        log.info("quiz_service fallback unavailable: %s", e)
+        return []
+
+
+async def fetch_quiz_questions(topic: str = "python", total_needed: int = 20, phone: str | None = None) -> list[dict]:
+    """Same contract as quiz_service.fetch_indiabix_questions: list of dicts, [] on any failure.
+    If this source returns nothing, falls back to quiz_service (IndiaBIX) so the user still gets a quiz."""
+    qs = await _fetch_quiz_questions(topic, total_needed, phone)
+    return qs or await _indiabix_fallback(topic, total_needed)
+
+
+async def _fetch_quiz_questions(topic: str, total_needed: int, phone: str | None) -> list[dict]:
     try:
         cats = await get_categories()
         t = (topic or "python").strip().lower()
@@ -700,14 +746,14 @@ async def fetch_quiz_questions(topic: str = "python", total_needed: int = 20) ->
             if kids["kind"] == "topics" and topic_n != _norm(c["name"]):
                 hit = match_item(kids["items"], t)
                 if hit:
-                    return [_public(q) for q in await get_questions(hit["url"], total_needed)]
+                    return [_public(q) for q in await get_questions(hit["url"], total_needed, phone=phone)]
         # 2) the topic IS a category -> a random sub-topic of it
         if cat:
             kids = await get_children(cat["url"])
             while kids["kind"] == "categories" and kids["items"]:
                 kids = await get_children(random.choice(kids["items"])["url"])
             if kids["kind"] == "topics" and kids["items"]:
-                return [_public(q) for q in await get_questions(random.choice(kids["items"])["url"], total_needed)]
+                return [_public(q) for q in await get_questions(random.choice(kids["items"])["url"], total_needed, phone=phone)]
         return []
     except Exception as e:
         log.exception("quiz fetch failed: %s", e)
@@ -747,7 +793,9 @@ async def _open(phone: str, item: dict, trail: list[str], notify=None):
     if item["kind"] == "topic":
         if notify:
             await notify(f"⏳ Fetching 20 random questions on *{item['name']}*...")
-        questions = [_public(q) for q in await get_questions(item["url"], 20)]
+        questions = [_public(q) for q in await get_questions(item["url"], 20, phone=phone)]
+        if not questions:
+            questions = await _indiabix_fallback(item["name"], 20)
         if not questions:
             return (["❌ I couldn't load questions for that topic right now. Please pick another one or try again shortly."],
                     None, None)
@@ -771,7 +819,7 @@ async def practice_start(phone: str, arg: str = "", notify=None):
             item = match_item(cats, key)
             if item:
                 return await _open(phone, item, [], notify)
-            questions = await fetch_quiz_questions(arg.strip(), 20)    # maybe a sub-topic name, e.g. "average"
+            questions = await fetch_quiz_questions(arg.strip(), 20, phone=phone)    # maybe a sub-topic name, e.g. "average"
             if questions:
                 await asyncio.to_thread(_save, phone, {})
                 return ([f"✅ Loaded *{len(questions)} random questions* on *{arg.strip().title()}*."],
