@@ -62,18 +62,68 @@ MAX_OPTIONS = 5                                                 # A-E (some ques
 MODE = "practice_menu"
 WA_LIMIT = 3800
 
-# Menu names from the site's "Practice MCQs" dropdown. Their URLs are discovered from the home page.
-CATEGORY_NAMES = [
-    "Aptitude", "English", "Verbal Reasoning", "Non Verbal Reasoning", "General Knowledge(GK)",
-    "General Science(GS)", "Data Interpretation(DI)", "Banking Awareness", "Current Affairs",
-    "Computer Fundamentals", "Networking", "SQL", "Database", "C Programming", "C++ Programming",
-    "Java", "Python", "Commerce", "Management", "Law", "Political Science", "Psychology", "Agriculture",
-]
-CATEGORY_FALLBACK = {"Aptitude": "/mcq-question-on-arithmetic-ability/"}
-# the topic keys quiz_service.py already understands -> a category here
-ALIASES = {"c": "C Programming", "cpp": "C++ Programming", "sql": "SQL", "reasoning": "Verbal Reasoning",
-           "logical": "Verbal Reasoning", "aptitude": "Aptitude", "networking": "Networking", "java": "Java",
-           "python": "Python"}
+# The three sections /practice offers. Paths are the site's own menu links (Practice MCQs, Engineering MCQs,
+# Computer MCQs dropdowns). A path containing "practice-mcq-question-on" is a topic that has questions itself;
+# any other path is a category page that lists topics.
+SECTIONS: dict[str, list[tuple[str, str]]] = {
+    "Important topics": [
+        ("Aptitude", "/mcq-question-on-arithmetic-ability/"),
+        ("English", "/mcq-question-on-competitive-english/"),
+        ("Verbal Reasoning", "/mcq-question-on-competitive-reasoning/"),
+        ("Non Verbal Reasoning", "/mcq-question-on-non-verbal-reasoning/"),
+        ("General Knowledge(GK)", "/mcq-question-on-general-knowledge/"),
+        ("General Science(GS)", "/mcq-question-on-general-science/"),
+        ("Data Interpretation(DI)", "/mcq-question-on-data-interpretation/"),
+        ("Banking Awareness", "/mcq-question-on-banking-awareness/"),
+        ("Commerce", "/mcq-question-on-commerce/"),
+        ("Management", "/mcq-question-on-management/"),
+        ("Law", "/mcq-question-on-law/"),
+        ("Political Science", "/mcq-question-on-political-science/"),
+        ("Psychology", "/mcq-question-on-psychology/"),
+        ("Agriculture", "/mcq-question-on-agriculture/"),
+    ],
+    "Engineering topics": [
+        ("Computer Science", "/mcq-question-on-computer-science/"),
+        ("Electronics & Communication", "/mcq-question-on-electronics-and-communications-engineering/"),
+        ("Mechanical Engineering", "/mcq-question-on-mechanical-engineering/"),
+        ("Civil Engineering", "/mcq-question-on-civil-engineering/"),
+        ("Electrical Engineering", "/mcq-question-on-electrical-engineering/"),
+        ("Chemical Engineering", "/mcq-question-on-chemical-engineering/"),
+        ("Automobile Engineering", "/mcq-question-on-automobile-engineering/"),
+        ("Biotechnology", "/mcq-question-on-biotechnology-engineering/"),
+        ("Mining Engineering", "/mcq-question-on-mining-engineering/"),
+        ("Geological Engineering", "/mcq-question-on-geological-engineering/"),
+        ("Engineering Mathematics", "/mcq-question-on-engineering-maths/"),
+        ("Engineering Physics", "/mcq-question-on-engineering-physics/"),
+        ("Engineering Chemistry", "/mcq-question-on-engineering-chemistry/"),
+        ("Metallurgical Engineering", "/mcq-question-on-metallurgical-engineering/"),
+    ],
+    "CS topics": [
+        ("Computer Fundamentals", "/mcq-question-on-computer-fundamentals/"),
+        ("Networking", "/mcq-question-on-networking/"),
+        ("Database", "/mcq-question-on-database/"),
+        ("SQL", "/mcq-question-on-sql/"),
+        ("MySQL", "/mcq-question-on-mysql/"),
+        ("C Programming", "/mcq-question-on-c-program/"),
+        ("C++ Programming", "/mcq-question-on-c-plus-plus-programming/"),
+        ("Java", "/mcq-question-on-java-program/"),
+        ("Python", "/mcq-question-on-python-program/"),
+        ("PHP", "/mcq-question-on-php/"),
+        ("JavaScript", "/mcq-question-on-javascript/"),
+        ("Artificial Intelligence", "/computer-science/practice-mcq-question-on-artificial-intelligence/"),
+        ("Machine Learning", "/computer-science/practice-mcq-question-on-machine-learning/"),
+        ("Data Science", "/mcq-question-on-data-science/"),
+        ("Cloud Computing", "/computer-science/practice-mcq-question-on-cloud-computing/"),
+        ("Hadoop", "/mcq-question-on-hadoop/"),
+        ("IoT", "/computer-science/practice-mcq-question-on-internet-of-things-(iot)/"),
+    ],
+}
+# the topic keys quiz_service.py already understands (and a few short forms) -> a name above
+ALIASES = {"c": "C Programming", "cpp": "C++ Programming", "c++": "C++ Programming", "sql": "SQL",
+           "reasoning": "Verbal Reasoning", "logical": "Verbal Reasoning", "aptitude": "Aptitude",
+           "networking": "Networking", "java": "Java", "python": "Python", "ai": "Artificial Intelligence",
+           "ml": "Machine Learning", "js": "JavaScript", "iot": "IoT", "cs": "CS topics",
+           "engineering": "Engineering topics", "important": "Important topics"}
 
 SEEN_PER_USER = 300                                              # remembered questions per user (so quizzes don't repeat)
 _FIGURE = re.compile(r"\b(figure|diagram|pie[- ]chart|bar[- ]graph|line graph|following graph|the image|the picture|shown below|image below)\b", re.I)
@@ -264,25 +314,15 @@ def _name_from_slug(href: str) -> str:
     return slug.replace("-", " ").title()
 
 
+_NAME_SUFFIX = re.compile(r"\s*[-–|:]?\s*(practice\s+)?(mcq\s+)?(questions?\s+)?(and|&)\s+answers?.*$|\s*practice\s+mcq.*$", re.I)
+
+
 def _link_name(a, href: str) -> str:
     for s in a.stripped_strings:
-        if not re.search(r"practice mcq|questions and answers?|view all|^\d+$", s, re.I) and 1 < len(s) < 80:
-            return clean(s)
+        name = _NAME_SUFFIX.sub("", s).strip()
+        if name and not re.fullmatch(r"view all|\d+|more|read more", name, re.I) and 1 < len(name) < 80:
+            return clean(name)
     return _name_from_slug(href)
-
-
-def parse_categories(html: str) -> list[dict]:
-    soup = BeautifulSoup(html, "html.parser")
-    wanted = {re.sub(r"\s+", "", n).lower(): n for n in CATEGORY_NAMES}
-    found: dict[str, str] = {}
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if not href or href.startswith(("#", "javascript:")):
-            continue
-        key = re.sub(r"\s+", "", a.get_text(" ", strip=True)).lower()
-        if key in wanted and wanted[key] not in found:
-            found[wanted[key]] = urljoin(BASE, href)
-    return [{"name": n, "url": found[n], "kind": "category"} for n in CATEGORY_NAMES if n in found]
 
 
 def parse_children(html: str, page_url: str, exclude: set[str] | None = None) -> dict:
@@ -601,20 +641,27 @@ def match_item(items: list[dict], query: str) -> dict | None:
 
 
 # ------------------------------------------------------------------ high level
+def _item(name: str, path: str, section: str) -> dict:
+    kind = "topic" if "practice-mcq-question-on" in path else "category"
+    return {"name": name, "url": BASE + path, "kind": kind, "section": section}
+
+
+def get_sections() -> list[dict]:
+    return [{"name": n, "kind": "section"} for n in SECTIONS]
+
+
+def section_items(section: str) -> list[dict]:
+    return [_item(n, p, section) for n, p in SECTIONS.get(section, [])]
+
+
 async def get_categories() -> list[dict]:
-    hit = _cached("categories")
-    if hit is not None:
-        return hit
-    items = []
-    try:
-        items = parse_categories(await _get(BASE + "/"))
-    except ScrapeError as e:
-        log.warning("categories: %s", e)
-    have = {i["name"] for i in items}
-    for n, path in CATEGORY_FALLBACK.items():
-        if n not in have:
-            items.append({"name": n, "url": BASE + path, "kind": "category"})
-    return _store("categories", items) if items else items
+    """Every category / direct topic of the three sections (first one wins if a name repeats)."""
+    out, seen = [], set()
+    for sec in SECTIONS:
+        for it in section_items(sec):
+            if it["name"] not in seen:
+                seen.add(it["name"]); out.append(it)
+    return out
 
 
 async def _chrome_urls() -> set[str]:
@@ -739,8 +786,11 @@ async def _fetch_quiz_questions(topic: str, total_needed: int, phone: str | None
         t = ALIASES.get(t, t)
         topic_n = _norm(t)
         cat = match_item(cats, t) if cats else None
+        if cat and cat["kind"] == "topic":                          # e.g. "machine learning": the topic itself
+            return [_public(q) for q in await get_questions(cat["url"], total_needed, phone=phone)]
         # 1) a sub-topic name inside the best-guess category (Aptitude first)
-        order = ([cat] if cat else []) + [c for c in cats if c["name"] == "Aptitude" and c is not cat]
+        order = [c for c in ([cat] if cat else []) + [c for c in cats if c["name"] == "Aptitude" and c is not cat]
+                 if c["kind"] == "category"]
         for c in order:
             kids = await get_children(c["url"])
             if kids["kind"] == "topics" and topic_n != _norm(c["name"]):
@@ -782,14 +832,16 @@ def _save(phone: str, state: dict):
 
 
 async def _show(phone: str, title: str, items: list[dict], kind: str, trail: list[str]):
-    word = "topic" if kind == "topics" else "category"
+    word = {"topics": "topic", "sections": "section"}.get(kind, "category")
     state = {"mode": MODE, "kind": kind, "title": title, "items": items, "trail": trail}
     await asyncio.to_thread(_save, phone, state)
     return _menu_messages(title, items, f"Reply with a *number* or the {word} name. Send *exit* to cancel.")
 
 
 async def _open(phone: str, item: dict, trail: list[str], notify=None):
-    """Opens a menu item: shows its children, or loads the quiz if it is a topic."""
+    """Opens a menu item: a section's categories, a category's topics, or - for a topic - the quiz itself."""
+    if item["kind"] == "section":
+        return await _show(phone, item["name"], section_items(item["name"]), "categories", [item["name"]]), None, None
     if item["kind"] == "topic":
         if notify:
             await notify(f"⏳ Fetching 20 random questions on *{item['name']}*...")
@@ -808,14 +860,20 @@ async def _open(phone: str, item: dict, trail: list[str], notify=None):
     return msgs, None, None
 
 
+async def _show_sections(phone: str):
+    return await _show(phone, "Choose a section", get_sections(), "sections", [])
+
+
 async def practice_start(phone: str, arg: str = "", notify=None):
-    """/practice [category or topic]. Returns (messages, questions|None, topic|None)."""
+    """/practice [section, category or topic]. Returns (messages, questions|None, topic|None).
+    /practice alone shows the 3 sections: Important topics, Engineering topics, CS topics."""
     try:
         cats = await get_categories()
-        if not cats:
-            return (["❌ I couldn't load the practice menu right now. Please try again in a few minutes."], None, None)
         if arg.strip():
             key = ALIASES.get(arg.strip().lower(), arg.strip())
+            sec = next((x for x in get_sections() if _norm(x["name"]) == _norm(key)), None)
+            if sec:
+                return await _open(phone, sec, [], notify)
             item = match_item(cats, key)
             if item:
                 return await _open(phone, item, [], notify)
@@ -824,8 +882,7 @@ async def practice_start(phone: str, arg: str = "", notify=None):
                 await asyncio.to_thread(_save, phone, {})
                 return ([f"✅ Loaded *{len(questions)} random questions* on *{arg.strip().title()}*."],
                         questions, arg.strip().lower())
-        msgs = await _show(phone, "Choose a category", cats, "categories", [])
-        return msgs, None, None
+        return await _show_sections(phone), None, None
     except Exception:
         log.exception("practice_start failed")
         return (["⚠️ Something went wrong loading the practice menu. Please try again."], None, None)
@@ -840,13 +897,12 @@ async def practice_reply(phone: str, text: str, notify=None):
         await asyncio.to_thread(_save, phone, {})
         return (["👋 Practice menu closed."], None, None)
     if text.lower() in ("menu", "back", "0"):
-        cats = await get_categories()
-        return (await _show(phone, "Choose a category", cats, "categories", []), None, None)
+        return (await _show_sections(phone), None, None)
     items = state.get("items") or []
     item = match_item(items, text)
     if not item:
         return ([f"🤔 I didn't find that. Reply with a number from 1 to {len(items)}, a name from the list, "
-                 "*back* for categories, or *exit*."], None, None)
+                 "*back* for the sections, or *exit*."], None, None)
     try:
         return await _open(phone, item, state.get("trail") or [], notify)
     except Exception:
