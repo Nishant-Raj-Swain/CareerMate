@@ -1,3 +1,5 @@
+
+
 from __future__ import annotations
 
 import asyncio
@@ -17,7 +19,7 @@ log = logging.getLogger("books")
 MODE = "books"
 UA = os.getenv("BOOKS_UA") or "CareerMateBot/1.0 (educational WhatsApp bot; free/legal books only)"
 HEADERS = {"User-Agent": UA, "Accept": "application/json"}
-MAX_MB = float(os.getenv("BOOKS_MAX_MB", "45"))                  # larger files are sent as a link instead
+MAX_MB = float(os.getenv("BOOKS_MAX_MB", "95"))                  # WhatsApp Cloud API supports up to 100MB; leave 5MB headroom
 MAX_PER_DAY = int(os.getenv("BOOKS_MAX_PER_DAY", "10"))
 TIMEOUT = float(os.getenv("BOOKS_TIMEOUT", "14"))
 EXIT_WORDS = {"exit", "cancel", "stop", "quit", "/exit", "/cancel", "back"}
@@ -542,8 +544,22 @@ class _FreeBookCentreScraper:
                 continue
             author = authors[i].strip() if i < len(authors) else ""
             page_count = pages[i].strip() if i < len(pages) else ""
-            # Clean author: strip "Author(s):" prefix if present
+            # Clean author: strip "Author(s):" prefix, collapse whitespace + line breaks
+            # (freebookcentre.net HTML often has \r\n inside the author span)
             author = re.sub(r'^Author\(s\):\s*', '', author, flags=re.IGNORECASE).strip()
+            author = re.sub(r'\s+', ' ', author)
+            # Strip "by <name>" suffix from title if present (freebookcentre.net sometimes
+            # includes the author in the title text like "Book Title by John Smith")
+            # Only strip if the part after "by" looks like a personal name (1-4 words,
+            # no digits, no periods).
+            by_match = re.match(r'^(.+?)\s+by\s+([A-Z][A-Za-z.\- ]{2,60})$', title)
+            if by_match and not re.search(r'\d', by_match.group(2)):
+                stripped_title = by_match.group(1).strip()
+                stripped_author = by_match.group(2).strip()
+                # Only accept the stripped author if we don't already have one from itemprop
+                if not author or author.lower() in ("na", "unknown"):
+                    author = stripped_author
+                title = stripped_title
             # Build full URL for the detail page
             full_url = urljoin(self.BASE + "/", detail_url.lstrip("/"))
             # fbc_id is the slug in the URL (e.g. Java-Notes-for-Professionals)
@@ -1061,7 +1077,10 @@ async def deliver(phone: str, cand: dict, say) -> None:
     c, url, why = failed[0] if failed else (cand, cand.get("url") or "", "unavailable")
     if not url and cand.get("ia"):
         url = f"{ARCHIVE}/details/{quote(cand['ia'])}"
-    note = "it's too large for WhatsApp" if why == "too big" else "I couldn't download it myself"
+    if why == "too big":
+        note = f"the file is larger than WhatsApp's {int(MAX_MB)}MB limit"
+    else:
+        note = "I couldn't download it myself"
     await say(f"📎 {_caption(cand)}\n\nHere is the direct link ({note}):\n{url}")
 
 
@@ -1264,12 +1283,15 @@ async def _deliver_topic_books(phone: str, say, cat_name: str, sub_name: str, su
     for i, b in enumerate(books, 1):
         title = b["title"]
         author = b.get("author", "")
-        # Build a search query: title + author surname (if it's a personal name, not an institution)
+        # Build the search query. Title-only is usually best for legal source matching
+        # (OpenStax, Gutenberg, Open Library etc. all index by title — adding author
+        # surname often confuses them and returns no results). We only add author
+        # if the title is very short (<3 words) AND author looks like a personal name.
         query = title
-        if author and author.lower() not in ("na", "unknown", ""):
+        title_word_count = len(title.split())
+        if author and author.lower() not in ("na", "unknown", "") and title_word_count < 3:
             first_author = re.split(r"[,;/]", author)[0].strip()
             if not re.search(r"(department|university|institute|college|school|professor|dept)", first_author, re.I):
-                # Take just the first word of the author's name for a cleaner query
                 query = f"{title} {first_author.split()[0]}"
         await say(f"\n📖 *Book {i}/{len(books)}:* {title}" + (f" — {author}" if author and author.lower() != "na" else ""))
         try:
@@ -1289,7 +1311,7 @@ async def _deliver_topic_books(phone: str, say, cat_name: str, sub_name: str, su
         else:
             # No legal source had this book — send the discovery site's detail page as a link
             await say(f"📎 Not in any free legal library. Browse/download here:\n{b['detail_url']}")
-    await say(f"\n✅ Done! Delivered *{delivered}/{len(books)}* books as PDFs. "
+    await say(f"\n✅ Done! Found *{delivered}/{len(books)}* books in free legal libraries (sent as PDFs or links if too large). "
               f"Send */books* for another, or */menu* for the menu.")
 
 
