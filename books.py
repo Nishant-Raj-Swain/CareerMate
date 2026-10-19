@@ -1,32 +1,3 @@
-# books.py
-# ---------------------------------------------------------------------------
-# /books  ->  the bot asks for the book's name, searches LEGAL free sources, and sends the PDF (or EPUB) to the user.
-#
-#   Sources (all free + legal; each is searched in parallel and the best match wins,
-#   so a book missing in one is found in another):
-#     1.  OpenStax               free college textbooks (physics, maths, chemistry, economics ...)   - PDF
-#     2.  Open Textbook Library  peer-reviewed open textbooks (UMN)                                  - PDF / link
-#     3.  Project Gutenberg      public-domain classics (via the Gutendex API)                       - EPUB
-#     4.  OAPEN                  open-access academic books                                          - PDF
-#     5.  DOAB                    Directory of Open Access Books (peer-reviewed, all OA)            - PDF
-#     6.  Google Books          only books flagged "free ebooks" (public domain / publisher-free)   - PDF/EPUB
-#     7.  Wikisource            Wikimedia free library (public domain / CC BY-SA)                   - PDF
-#     8.  Open Library + Internet Archive  only items flagged public / Creative Commons / public domain - PDF
-#
-#   Standard Ebooks was considered but is NOT included: their robots.txt explicitly forbids
-#   automated downloads (`Disallow: /ebooks/*/downloads/*`). Respect it.
-#
-#   In-copyright books that are only "borrowable" are never downloaded. Every file is sent with its source + licence.
-#   (NCERT school textbooks: the bot sends the official page link - their files are per chapter.)
-#
-# Public API used by main.py (state lives in users.state like every other mode):
-#       done = await books.start(phone, arg, say)      # /books [book name]    (True = finished, state cleared)
-#       done = await books.handle(phone, text, say)    # while state mode == books.MODE
-#
-# Check each source from your server with:   python books.py probe "pride and prejudice"
-#                                            python books.py get   "university physics volume 1"   (downloads the file)
-# ---------------------------------------------------------------------------
-
 from __future__ import annotations
 
 import asyncio
@@ -36,7 +7,7 @@ import os
 import re
 import time
 from datetime import date
-from urllib.parse import quote, quote_plus
+from urllib.parse import quote, quote_plus, urljoin
 
 import httpx
 import requests
@@ -409,6 +380,421 @@ SOURCES = [
 ]
 
 
+
+
+
+
+
+
+# ===========================================================================
+# DISCOVERY SOURCES (inlined scrapers)
+# ===========================================================================
+# These two scrapers power the /books 'Browse by Topic' feature and the
+# recommendation fallback. They are inlined (not imported) so the bot's books
+# feature is self-contained in a single file.
+#
+# - _FreeBookCentreScraper: scrapes freebookcentre.net (curated index of free
+#   programming/technical books). Hides download URLs behind JavaScript, so we
+#   use it only for taxonomy + book metadata; PDFs are delivered via the 9 legal
+#   sources in SOURCES above.
+# - _FreeComputerBooksScraper: scrapes freecomputerbooks.com (similar curated
+#   index of free computer/math/tech books). Same approach.
+
+class _FreeBookCentreScraper:
+    """Inlined scraper for freebookcentre.net.
+
+    Used as a discovery layer: returns book titles + authors, which books.py then
+    searches for in the 9 legal sources to deliver actual PDFs.
+    """
+    BASE = 'https://www.freebookcentre.net'
+    HEADERS = {'User-Agent': 'CareerMateBot/1.0 (educational WhatsApp bot; free/legal books only)', 'Accept': 'text/html'}
+    TIMEOUT = 20.0
+    _CACHE_TTL = 7 * 86400  # 1 week
+
+    CATEGORIES: list[tuple[str, str]] = [
+    ("Computer Science",       "/CompuScience/compscCategory.html"),
+    ("Programming Languages",  "/Language/langCategory.html"),
+    ("Java / Advanced Java",   "/JavaTech/javaCategory.html"),
+    ("Unix / Linux",           "/UnixCategory/unixCategory.html"),
+    ("Web Technology",         "/Web/webCategory.html"),
+    ("Database Systems",       "/Database/dbCategory.html"),
+    ("Medical",                "/medical_text_books_journals/medical_text_books_online.html"),
+    ("Microsoft Technology",   "/MicroSoftTech/microsoftCategory.html"),
+    ("Special Topics",        "/SpecialCat/specialCategory.html"),
+    ("Electronics",            "/electronics_communication_books/electronics_communication_books.html"),
+    ("File System Specs",      "/file_system_specification/file_system_specifications.html"),
+    ("Graphics Tools",         "/graphics-design-books/web-design-tools.html"),
+    ("Mobile Technology",      "/mobile-technology/mobile-technology-books.html"),
+    ("Networking",             "/Networking/networkCategory.html"),
+    ("Mathematics",            "/SpecialCat/Free-Mathematics-Books-Download.html"),
+    ("Physics",                "/Physics/Physics-Books-Online.html"),
+    ("Hardware Buses",         "/HardwareBus/Hardware-Buses-Books.html"),
+    ("Chemistry",              "/Chemistry/Chemistry-Books-Online.html"),
+    ("Biology",                "/Biology/Biology-Books-Online.html"),
+    ("Law",                    "/Law/Law-Books.html"),
+    ("Electronics Engineering","/Electronics/Engineering-Books-Online.html"),
+    ("Business & Finance",     "/Business/Business-and-Finance-Books.html"),
+    ("Literature & Fiction",   "/Fiction/Fiction-Books.html"),
+    ("Cooking, Food & Drink",  "/Cooking/Cooking-Food-Drink-Books.html"),
+    ("Earth Sciences",         "/EarthSciences/Earth-Sciences-Books.html"),
+    ("Aerospace Engineering",  "/AeroSpace/AeroSpace-Engineering-Books.html"),
+    ("Mechanical Engineering", "/Mechanical/Mechanical-Engineering-Books.html"),
+    ("Electrical Engineering", "/Electrical/Electrical-Engineering-Books.html"),
+    ("Chemical Engineering",   "/Chemical/Chemical-Engineering-Books.html"),
+    ("Civil Engineering",      "/Civil/Civil-Engineering-Books.html"),
+    ]
+
+    _subtopic_cache: dict = {}
+    _book_cache: dict = {}
+
+    @staticmethod
+    def _log(msg, *args):
+        log.info("fbc: " + msg, *args)
+
+    async def _fetch(self, client: httpx.AsyncClient, path: str) -> str:
+        url = urljoin(self.BASE + "/", path.lstrip("/"))
+        r = await client.get(url, timeout=self.TIMEOUT)
+        r.raise_for_status()
+        return r.text
+
+    def _parse_subtopics(self, html: str, category_path: str) -> list[tuple[str, str]]:
+        """Extract subtopic (name, url) pairs from a category page.
+
+        freebookcentre.net category pages list subtopics as <a href="/JavaTech/Free-Advanced-Java-books-download.html">Advanced Java</a>
+        We filter to subtopic pages (URLs containing 'Books' or 'books' and ending in .html),
+        skip navigation and footer links, and dedupe.
+        """
+        # Pull all anchor tags with their href and visible text
+        pairs = re.findall(r'<a[^>]+href="([^"]+)"[^>]*>\s*([^<]+\w[^<]*)</a>', html)
+        seen = set()
+        out = []
+        for href, text in pairs:
+            text = text.strip()
+            # Skip empty, navigation, or non-subtopic links
+            if not text or len(text) > 60:
+                continue
+            # Subtopic URLs look like /JavaTech/Free-Advanced-Java-books-download.html
+            # i.e. they live in a category subfolder and end in .html, and contain "book"
+            href_lower = href.lower()
+            if not href.startswith("/"):
+                continue
+            if not href_lower.endswith(".html"):
+                continue
+            if "book" not in href_lower:
+                continue
+            # Skip footer / about / contact / privacy / sitemap
+            if any(skip in href_lower for skip in ("about", "contact", "privacy", "terms", "sitemap", "link_us", "aboutus")):
+                continue
+            # Must be in the same subfolder as the category (e.g. /JavaTech/ for Java category)
+            # We compare the first path segment
+            cat_seg = category_path.strip("/").split("/")[0] if category_path else ""
+            href_seg = href.strip("/").split("/")[0] if href else ""
+            if cat_seg and href_seg and cat_seg != href_seg:
+                # Allow cross-folder subtopic links (some categories link to /SpecialCat/...)
+                # but be conservative: only accept if BOTH segments look like content folders
+                if href_seg in ("aboutus", "contactus", "link_us"):
+                    continue
+            key = (text, href)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append((text, href))
+        return out
+
+
+    def _parse_books(self, html: str, subtopic_url: str) -> list[dict]:
+        """Extract book entries from a subtopic page.
+
+        Each book block looks like:
+          <div itemtype="http://schema.org/Book" itemscope>
+            <a itemprop="image" href="../Java-Books-Download/Java-Notes-for-Professionals.html">...</a>
+            <a itemprop="name" href="../Java-Books-Download/Java-Notes-for-Professionals.html">Java Notes for Professionals</a>
+            <span itemprop="description">...</span>
+            <span itemprop="author">GoalKicker.com</span>
+            <span itemprop="numberOfPages">976</span>
+          </div>
+
+        We extract: title, author, pages, detail_url.
+        """
+        # The book detail link is on the itemprop="name" anchor.
+        # Pattern: <a [^>]*itemprop="name"[^>]*href="...">Title</a>
+        # OR:      <a [^>]*href="..."[^>]*itemprop="name"[^>]*>Title</a>
+        title_blocks = re.findall(
+            r'<a[^>]*itemprop="name"[^>]*href="([^"]+)"[^>]*>\s*([^<]+\w[^<]*)</a>',
+            html, re.IGNORECASE
+        )
+        if not title_blocks:
+            # Fallback: href first, then itemprop
+            title_blocks = re.findall(
+                r'<a[^>]*href="([^"]+)"[^>]*itemprop="name"[^>]*>\s*([^<]+\w[^<]*)</a>',
+                html, re.IGNORECASE
+            )
+
+        # Find authors (itemprop="author") — text content of the span/paragraph
+        authors = re.findall(r'itemprop="author"[^>]*>([^<]+)', html)
+        # Find page counts (itemprop="numberOfPages")
+        pages = re.findall(r'itemprop="numberOfPages"[^>]*>([^<]+)', html)
+
+        out = []
+        for i, (detail_url, title) in enumerate(title_blocks):
+            title = title.strip()
+            if not title or len(title) > 200:
+                continue
+            author = authors[i].strip() if i < len(authors) else ""
+            page_count = pages[i].strip() if i < len(pages) else ""
+            # Clean author: strip "Author(s):" prefix if present
+            author = re.sub(r'^Author\(s\):\s*', '', author, flags=re.IGNORECASE).strip()
+            # Build full URL for the detail page
+            full_url = urljoin(self.BASE + "/", detail_url.lstrip("/"))
+            # fbc_id is the slug in the URL (e.g. Java-Notes-for-Professionals)
+            fbc_id = detail_url.rsplit("/", 1)[-1].replace(".html", "")
+            out.append({
+                "title": title,
+                "author": author,
+                "pages": page_count,
+                "detail_url": full_url,
+                "fbc_id": fbc_id,
+            })
+        return out
+
+
+    async def get_categories(self) -> list[tuple[str, str]]:
+        """Returns the static list of (category_name, category_path) tuples."""
+        return list(self.CATEGORIES)
+
+    async def get_subtopics(self, category_path: str, *, force_refresh: bool = False) -> list[tuple[str, str]]:
+        """Returns [(subtopic_name, subtopic_url), ...] for a category page. Cached weekly."""
+        cached = self._subtopic_cache.get(category_path)
+        if cached and not force_refresh and time.time() - cached[0] < self._CACHE_TTL:
+            return cached[1]
+        async with httpx.AsyncClient(follow_redirects=True, headers=self.HEADERS) as client:
+            html = await self._fetch(client, category_path)
+        subs = self._parse_subtopics(html, category_path)
+        self._subtopic_cache[category_path] = (time.time(), subs)
+        self._log("subtopics for %s: %d", category_path, len(subs))
+        return subs
+
+    async def get_top_books(self, subtopic_url: str, n: int = 5, *, force_refresh: bool = False) -> list[dict]:
+        """Returns the top N books from a subtopic page. Cached weekly."""
+        cached = self._book_cache.get(subtopic_url)
+        if cached and not force_refresh and time.time() - cached[0] < self._CACHE_TTL:
+            return cached[1][:n]
+        async with httpx.AsyncClient(follow_redirects=True, headers=self.HEADERS) as client:
+            html = await self._fetch(client, subtopic_url)
+        books = self._parse_books(html, subtopic_url)
+        self._book_cache[subtopic_url] = (time.time(), books)
+        self._log("books for %s: %d total", subtopic_url, len(books))
+        return books[:n]
+
+
+class _FreeComputerBooksScraper:
+    """Inlined scraper for freebookcentre.net.
+
+    Used as a discovery layer: returns book titles + authors, which books.py then
+    searches for in the 9 legal sources to deliver actual PDFs.
+    """
+    BASE = 'https://freecomputerbooks.com'
+    HEADERS = {'User-Agent': 'CareerMateBot/1.0 (educational WhatsApp bot; free/legal books only)', 'Accept': 'text/html'}
+    TIMEOUT = 20.0
+    _CACHE_TTL = 7 * 86400  # 1 week
+
+    CATEGORIES: list[tuple[str, str]] = [
+    ("Computer Engineering", "/eeCategory.html"),
+    ("Computer Languages",   "/langCategory.html"),
+    ("Computer Networks",   "/networkCategory.html"),
+    ("Computer Science",    "/compscCategory.html"),
+    ("Data Science / Database", "/dbCategory.html"),
+    ("Java and Jakarta EE", "/javaCategory.html"),
+    ("Linux and Unix",      "/unixCategory.html"),
+    ("Mathematics",         "/mathCategory.html"),
+    ("Microsoft and .NET",  "/microsoftCategory.html"),
+    ("Software Engineering","/softwareCategory.html"),
+    ("Special Topics",     "/specialCategory.html"),
+    ("Web Programming",     "/webCategory.html"),
+    ]
+
+    _subtopic_cache: dict = {}
+    _book_cache: dict = {}
+
+    @staticmethod
+    def _log(msg, *args):
+        log.info("fcb: " + msg, *args)
+
+    async def _fetch(self, client: httpx.AsyncClient, path: str) -> str:
+        url = urljoin(self.BASE + "/", path.lstrip("/"))
+        r = await client.get(url, timeout=self.TIMEOUT)
+        r.raise_for_status()
+        return r.text
+
+    def _parse_subtopics(self, html: str, category_path: str) -> list[tuple[str, str]]:
+        """Extract (subtopic_name, subtopic_url) pairs from a category landing page.
+
+        freecomputerbooks.com category pages have:
+          1. A sidebar with cross-category nav (Math, Python, etc.) — we EXCLUDE these.
+          2. A main content area listing actual subtopics for THIS category
+             (e.g. for Java: Basic Java Programming -> /javaBasicBooks.html,
+                                        Advanced Java -> /javaAdvancedBooks.html).
+
+        We extract the real subtopics by:
+          - Deriving the category prefix from the category_path (e.g. /javaCategory.html -> 'java')
+          - Only keeping subtopic URLs whose slug starts with that prefix
+            (e.g. /javaBasicBooks.html matches, /webHtmlBooks.html doesn't)
+        """
+        # Derive the category prefix from the category_path
+        # /javaCategory.html -> 'java'
+        # /langCategory.html -> 'lang'
+        # /compscCategory.html -> 'compsc'
+        # /eeCategory.html -> 'ee'
+        cat_filename = category_path.rsplit("/", 1)[-1].lower()  # "javacategory.html"
+        cat_prefix = cat_filename.replace("category.html", "").replace(".html", "")
+        if not cat_prefix:
+            return []
+
+        pairs = re.findall(r'<a[^>]+href="([^"]+)"[^>]*>([^<]{2,80})</a>', html)
+        seen = set()
+        out = []
+        for href, text in pairs:
+            text = text.strip()
+            if not text or len(text) > 80:
+                continue
+            # Normalize: convert absolute URLs to relative
+            if href.startswith(self.BASE):
+                href = href[len(self.BASE):]
+            href_lower = href.lower()
+            # Skip external links
+            if href.startswith("http"):
+                continue
+            # Skip category landing pages
+            if href_lower.endswith("category.html"):
+                continue
+            # Skip footer / about / contact / privacy / sitemap
+            if any(skip in href_lower for skip in ("about", "contact", "privacy", "terms", "sitemap", "tradepub", "amazon")):
+                continue
+            # Skip cross-promo links
+            if any(skip in text.lower() for skip in ("magazine", "research library", "subscription", "tradepub", "bargin")):
+                continue
+            # Must be an .html subpage
+            if not href_lower.endswith(".html"):
+                continue
+            # Must contain "books.html" (all subtopic pages do)
+            if "books.html" not in href_lower:
+                continue
+            # KEY FILTER: the subtopic URL slug must start with this category's prefix
+            # e.g. for category_prefix='java', accept '/javaBasicBooks.html' but reject '/webHtmlBooks.html'
+            # We compare the leading part of the filename
+            filename = href_lower.rsplit("/", 1)[-1].replace(".html", "")  # e.g. "javabasicbooks"
+            if not filename.startswith(cat_prefix):
+                continue
+            key = (text, href)
+            if key in seen:
+                continue
+            # Also dedupe by URL (some subtopic pages are linked multiple times
+            # with different display text — keep the first, which is usually the
+            # descriptive title)
+            if href in {h for _, h in out}:
+                continue
+            seen.add(key)
+            out.append((text, href))
+        return out
+
+
+    def _parse_books(self, html: str, subtopic_url: str) -> list[dict]:
+        """Extract book entries from a subtopic page.
+
+        Book entries on freecomputerbooks.com look like:
+          <li>
+            <div>
+              <img src="covers/Book-Title_43x55.png"/>
+              <a href="/Book-Title.html">Book Title (Author Name)</a>
+              <p>Description...</p>
+            </div>
+          </li>
+
+        We extract: title (with author if present in parentheses), detail_url.
+        The author is often embedded in the title text after the title, like
+        "Book Title (Author Name)" or "Book Title - Author Name".
+        """
+        out = []
+        # Find each <li><div>...<img>...<a href="...">Title</a>...</div></li> block
+        # Strategy: find all <a href="/Some-Book.html">Title Text</a> that come
+        # after an <img> tag whose src starts with "covers/" — that's the book cover
+        # and the anchor immediately after is the book title link.
+
+        # Pattern: <img src="covers/..." ...> <a href="...">Title</a>
+        # Allow whitespace/newlines between tags
+        pattern = re.compile(
+            r'<img[^>]+src="covers/[^"]+"[^>]*/?>\s*<a[^>]+href="([^"]+)"[^>]*>([^<]+)</a>',
+            re.IGNORECASE | re.DOTALL
+        )
+        for match in pattern.finditer(html):
+            detail_url = match.group(1).strip()
+            title_text = match.group(2).strip()
+            if not title_text or len(title_text) > 200:
+                continue
+            # The title often contains the author in parens: "Book Title (Author Name)"
+            # or after a dash: "Book Title - Author Name"
+            author = ""
+            # Try parens first
+            m = re.search(r"\(([^)]+)\)\s*$", title_text)
+            if m:
+                author = m.group(1).strip()
+                title_text = title_text[:m.start()].strip()
+            else:
+                # Try em-dash or hyphen (but only if the part after looks like a name, not a subtitle)
+                m = re.search(r"\s+[\u2013\u2014-]\s+([^-\u2013\u2014]{3,60})$", title_text)
+                if m:
+                    candidate = m.group(1).strip()
+                    # Heuristic: a name has 1-4 words, no periods, no digits
+                    words = candidate.split()
+                    if 1 <= len(words) <= 4 and not re.search(r"\d", candidate) and "." not in candidate:
+                        author = candidate
+                        title_text = title_text[:m.start()].strip()
+            # Build full URL
+            full_url = urljoin(self.BASE + "/", detail_url.lstrip("/"))
+            out.append({
+                "title": title_text,
+                "author": author,
+                "pages": "",          # freecomputerbooks doesn't list page counts in the subtopic view
+                "detail_url": full_url,
+                "fcb_id": detail_url.rsplit("/", 1)[-1].replace(".html", ""),
+            })
+        return out
+
+
+    async def get_categories(self) -> list[tuple[str, str]]:
+        """Returns the static list of (category_name, category_path) tuples."""
+        return list(self.CATEGORIES)
+
+    async def get_subtopics(self, category_path: str, *, force_refresh: bool = False) -> list[tuple[str, str]]:
+        """Returns [(subtopic_name, subtopic_url), ...] for a category page. Cached weekly."""
+        cached = self._subtopic_cache.get(category_path)
+        if cached and not force_refresh and time.time() - cached[0] < self._CACHE_TTL:
+            return cached[1]
+        async with httpx.AsyncClient(follow_redirects=True, headers=self.HEADERS) as client:
+            html = await self._fetch(client, category_path)
+        subs = self._parse_subtopics(html, category_path)
+        self._subtopic_cache[category_path] = (time.time(), subs)
+        self._log("subtopics for %s: %d", category_path, len(subs))
+        return subs
+
+    async def get_top_books(self, subtopic_url: str, n: int = 5, *, force_refresh: bool = False) -> list[dict]:
+        """Returns the top N books from a subtopic page. Cached weekly."""
+        cached = self._book_cache.get(subtopic_url)
+        if cached and not force_refresh and time.time() - cached[0] < self._CACHE_TTL:
+            return cached[1][:n]
+        async with httpx.AsyncClient(follow_redirects=True, headers=self.HEADERS) as client:
+            html = await self._fetch(client, subtopic_url)
+        books = self._parse_books(html, subtopic_url)
+        self._book_cache[subtopic_url] = (time.time(), books)
+        self._log("books for %s: %d total", subtopic_url, len(books))
+        return books[:n]
+
+
+# Module-level instances of each scraper (the bot uses these everywhere)
+_FBC = _FreeBookCentreScraper()
+_FCB = _FreeComputerBooksScraper()
+# ===========================================================================
+# ===========================================================================
 async def resolve_archive(client, ia_id: str) -> tuple[str, int]:
     """Download URL (+ size) of the best PDF of an Internet Archive item."""
     meta = await _json(client, f"{ARCHIVE}/metadata/{quote(ia_id)}")
@@ -712,11 +1098,16 @@ def _save(phone: str, state: dict):
 
 
 # ----------------------------------------------------------------------- conversation
-PROMPT = ("📚 *Free Books*\n\nSend me the *exact name* of the book (add the author if you know it), e.g.\n"
-          "• Pride and Prejudice\n• University Physics Volume 1\n• Calculus Volume 1\n\n"
+PROMPT = ("📚 *Free Books*\n\nChoose an option:\n"
+          "*1.* Browse by topic (Categories → Subtopics → Top 5 books)\n"
+          "*2.* Search by book name + author\n\n"
+          "Reply with *1* or *2* (or send *exit* to cancel).\n\n"
           "I search OpenStax, Open Textbook Library, Project Gutenberg, OAPEN, DOAB,\n"
-          "Google Books, Wikisource, Open Library and the Internet Archive for a *free, legal* copy.\n"
-          "Send *exit* to cancel.")
+          "Google Books, Wikisource, Open Library and the Internet Archive for *free, legal* copies.")
+_TOPIC_PROMPT = ("📚 *Browse by Topic*\n\n"
+                  "Send the *number* of a category (or *back* for the menu, *exit* to cancel):\n\n")
+_SUBTOPIC_PROMPT = ("📚 *{cat}*\n\n"
+                    "Send the *number* of a subtopic (or *back* for categories, *exit* to cancel):\n\n")
 _NCERT = re.compile(r"\b(ncert|cbse|class\s*(\d{1,2})|std\s*\d{1,2})\b", re.I)
 
 
@@ -726,8 +1117,10 @@ def is_active(state: dict | None) -> bool:
 
 async def start(phone: str, arg: str, say) -> bool:
     """/books [book name]. True = the job is over (state cleared)."""
-    await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "ask"})
+    await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "menu"})
     if arg and arg.strip():
+        # If user typed `/books pride and prejudice`, treat it as a direct name search
+        await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "ask"})
         return await handle(phone, arg, say)
     await say(PROMPT)
     return False
@@ -741,6 +1134,279 @@ def _pick_text(cands: list[dict]) -> str:
     return "I found these. Reply with the *number* of the one you want (or type another book name, or *exit*):\n\n" + "\n".join(lines)
 
 
+# ----------------------------------------------------------------------- topic browsing
+# State machine for topic mode:
+#   step=menu        -> user picks 1 (topic) or 2 (search)
+#   step=cat         -> user picks a category number (paginated 10/page)
+#   step=sub         -> user picks a subtopic number (paginated 10/page)
+#   step=topic_books -> bot fetches top 5 books, runs legal search() for each, delivers PDFs
+_TOPIC_PAGE_SIZE = 10
+
+
+async def _show_categories(phone: str, say, page: int = 0) -> None:
+    """Send a paginated list of categories to the user.
+
+    Categories are merged from BOTH discovery sources (freebookcentre.net and
+    freecomputerbooks.com). Each entry is tagged with its source so the bot
+    can route to the correct scraper when the user picks one.
+    """
+    cats = await _all_categories()
+    if not cats:
+        await say("⚠️ Topic browsing is not available right now (scraper modules missing). Send *2* to search by name, or *exit*.")
+        return
+    total_pages = (len(cats) + _TOPIC_PAGE_SIZE - 1) // _TOPIC_PAGE_SIZE
+    page = max(0, min(page, total_pages - 1))
+    start_i = page * _TOPIC_PAGE_SIZE
+    chunk = cats[start_i:start_i + _TOPIC_PAGE_SIZE]
+    lines = [_TOPIC_PROMPT]
+    for i, (name, _, source) in enumerate(chunk, 1):
+        src_tag = "📊 FBC" if source == "fbc" else "📗 FCB"
+        lines.append(f"*{start_i + i}.* {name}  ({src_tag})")
+    nav = []
+    if page > 0:
+        nav.append("Send *prev* for previous page")
+    if page < total_pages - 1:
+        nav.append("*next* for more")
+    nav.append("*back* for menu")
+    nav.append("*exit* to cancel")
+    lines.append("\n" + " • ".join(nav))
+    await say("\n".join(lines))
+
+
+async def _all_categories() -> list[tuple[str, str, str]]:
+    """Merge categories from both discovery sources.
+
+    Returns a list of (category_name, category_path, source) tuples where
+    source is either 'fbc' (freebookcentre.net) or 'fcb' (freecomputerbooks.com).
+    Categories are sorted alphabetically, with duplicates between sources kept
+    (the user can pick either one).
+    """
+    out: list[tuple[str, str, str]] = []
+    # Both scrapers are inlined classes in this file, so they're always available.
+    # We use try/except Exception (not ImportError) to handle network errors gracefully.
+    try:
+        for name, path in await _FBC.get_categories():
+            out.append((name, path, "fbc"))
+    except Exception as e:
+        log.warning("_FBC.get_categories failed: %s", e)
+    try:
+        for name, path in await _FCB.get_categories():
+            out.append((name, path, "fcb"))
+    except Exception as e:
+        log.warning("_FCB.get_categories failed: %s", e)
+    # Sort alphabetically by name
+    out.sort(key=lambda x: x[0].lower())
+    return out
+
+
+async def _show_subtopics(phone: str, say, cat_name: str, cat_path: str, source: str = "fbc", page: int = 0) -> None:
+    """Send a paginated list of subtopics for a category from a given source.
+
+    `source` is either 'fbc' (freebookcentre.net) or 'fcb' (freecomputerbooks.com).
+    """
+    # Both scrapers are inlined classes in this file, so they're always available.
+    # Pick the right one based on the source tag.
+    scraper = _FBC if source == "fbc" else _FCB
+    await say(f"🔎 Loading subtopics for *{cat_name}*...")
+    try:
+        subs = await scraper.get_subtopics(cat_path)
+    except Exception as e:
+        log.exception("get_subtopics failed: %s", e)
+        await say(f"⚠️ Couldn't load subtopics for *{cat_name}*. Try another category, or *back* for the menu.")
+        return
+    if not subs:
+        await say(f"😕 No subtopics found for *{cat_name}*. Try another category, or *back*.")
+        return
+    total_pages = (len(subs) + _TOPIC_PAGE_SIZE - 1) // _TOPIC_PAGE_SIZE
+    page = max(0, min(page, total_pages - 1))
+    start_i = page * _TOPIC_PAGE_SIZE
+    chunk = subs[start_i:start_i + _TOPIC_PAGE_SIZE]
+    src_tag = "FBC" if source == "fbc" else "FCB"
+    lines = [_SUBTOPIC_PROMPT.format(cat=f"{cat_name}  ({src_tag})")]
+    for i, (name, _) in enumerate(chunk, 1):
+        lines.append(f"*{start_i + i}.* {name}")
+    nav = []
+    if page > 0:
+        nav.append("*prev* for previous")
+    if page < total_pages - 1:
+        nav.append("*next* for more")
+    nav.append("*back* for categories")
+    nav.append("*exit* to cancel")
+    lines.append("\n" + " • ".join(nav))
+    await say("\n".join(lines))
+
+
+async def _deliver_topic_books(phone: str, say, cat_name: str, sub_name: str, sub_url: str, source: str = "fbc") -> None:
+    """Fetch top 5 books from the chosen discovery source for a subtopic, run legal search()
+    for each, and deliver the first PDF found per book. Books not found legally get a
+    'not found' notice with the discovery site's detail-page link as a fallback.
+    """
+    # Both scrapers are inlined classes in this file, so they're always available.
+    # Pick the right one based on the source tag.
+    if source == "fbc":
+        scraper = _FBC
+        site_name = "freebookcentre.net"
+    else:  # 'fcb'
+        scraper = _FCB
+        site_name = "freecomputerbooks.com"
+    await say(f"🔎 Fetching top 5 *{sub_name}* books and searching legal libraries...\n"
+              f"(This takes ~30s — I check 9 free legal sources for each book)")
+    try:
+        books = await scraper.get_top_books(sub_url, n=5)
+    except Exception as e:
+        log.exception("get_top_books failed: %s", e)
+        await say("⚠️ Couldn't load books for that subtopic. Try another, or *back*.")
+        return
+    if not books:
+        await say(f"😕 No books found under *{sub_name}*. Try another subtopic, or *back*.")
+        return
+    delivered = 0
+    for i, b in enumerate(books, 1):
+        title = b["title"]
+        author = b.get("author", "")
+        # Build a search query: title + author surname (if it's a personal name, not an institution)
+        query = title
+        if author and author.lower() not in ("na", "unknown", ""):
+            first_author = re.split(r"[,;/]", author)[0].strip()
+            if not re.search(r"(department|university|institute|college|school|professor|dept)", first_author, re.I):
+                # Take just the first word of the author's name for a cleaner query
+                query = f"{title} {first_author.split()[0]}"
+        await say(f"\n📖 *Book {i}/{len(books)}:* {title}" + (f" — {author}" if author and author.lower() != "na" else ""))
+        try:
+            found, _ = await search(query)
+        except Exception as e:
+            log.warning("search for topic book failed: %s", e)
+            found = []
+        if found and found[0]["score"] >= CUTOFF:
+            top = found[0]
+            await say(f"✅ Found via *{top['source']}*. Sending...")
+            try:
+                await deliver(phone, top, say)
+                delivered += 1
+            except Exception as e:
+                log.exception("deliver failed: %s", e)
+                await say(f"⚠️ Couldn't send the file. Direct link: {top.get('url') or b['detail_url']}")
+        else:
+            # No legal source had this book — send the discovery site's detail page as a link
+            await say(f"📎 Not in any free legal library. Browse/download here:\n{b['detail_url']}")
+    await say(f"\n✅ Done! Delivered *{delivered}/{len(books)}* books as PDFs. "
+              f"Send */books* for another, or */menu* for the menu.")
+
+
+async def _recommend_books(query: str, n: int = 5) -> list[dict]:
+    """Search BOTH discovery sites (freebookcentre.net + freecomputerbooks.com) for books
+    that fuzzy-match the query, return top N as recommendations.
+
+    Used when the legal `search()` returns nothing — we still want to give the user
+    a few 'maybe you meant these' suggestions, each with a link to the detail page.
+    """
+    import difflib
+    q_norm = _norm(query)
+    q_tokens = set(_tokens(query))
+    if not q_tokens:
+        return []
+    candidates: list[dict] = []
+
+    # Source 1: freebookcentre.net — iterate all categories' first subtopic (cheap heuristic)
+    # In production we'd want a search endpoint, but freebookcentre doesn't have one.
+    # Instead, we fetch a few popular category subtopic pages and fuzzy-match titles.
+    # We cap at ~5 subtopic fetches so this stays under ~10 seconds.
+    # (Scrapers are inlined classes, so no ImportError possible — only network errors.)
+    try:
+        # Pick a small set of categories likely to match the query (programming/CS first)
+        priority_cats = [
+            ("Java / Advanced Java", "/JavaTech/javaCategory.html"),
+            ("Computer Science",      "/CompuScience/compscCategory.html"),
+            ("Programming Languages", "/Language/langCategory.html"),
+            ("Mathematics",           "/SpecialCat/Free-Mathematics-Books-Download.html"),
+        ]
+        all_cats = await _FBC.get_categories()
+        # Filter priority_cats to only those that exist
+        priority_cats = [c for c in priority_cats if c in all_cats]
+        for cat_name, cat_path in priority_cats[:3]:
+            try:
+                subs = await _FBC.get_subtopics(cat_path)
+                # Take the first 2 subtopics of each priority category
+                for sub_name, sub_url in subs[:2]:
+                    try:
+                        books = await _FBC.get_top_books(sub_url, n=10)
+                        for b in books:
+                            # Score the title against the query
+                            t_norm = _norm(b["title"])
+                            if not t_norm:
+                                continue
+                            t_tokens = set(_tokens(b["title"]))
+                            # Require at least one query token to appear in the title
+                            if not (q_tokens & t_tokens):
+                                continue
+                            s = difflib.SequenceMatcher(None, q_norm, t_norm).ratio()
+                            if s >= 0.20:
+                                b = dict(b)
+                                b["score"] = s
+                                b["source"] = "FBC"
+                                candidates.append(b)
+                    except Exception as e:
+                        log.warning("fbc sub fetch %s failed: %s", sub_url, e)
+                        continue
+            except Exception as e:
+                log.warning("fbc cat %s failed: %s", cat_path, e)
+                continue
+    except Exception as e:
+        log.warning("_FBC recommendations failed: %s", e)
+
+    # Source 2: freecomputerbooks.com — same approach
+    try:
+        priority_cats_fcb = [
+            ("Java and Jakarta EE", "/javaCategory.html"),
+            ("Computer Languages", "/langCategory.html"),
+            ("Computer Science",    "/compscCategory.html"),
+            ("Mathematics",        "/mathCategory.html"),
+        ]
+        all_cats_fcb = await _FCB.get_categories()
+        priority_cats_fcb = [c for c in priority_cats_fcb if c in all_cats_fcb]
+        for cat_name, cat_path in priority_cats_fcb[:3]:
+            try:
+                subs = await _FCB.get_subtopics(cat_path)
+                for sub_name, sub_url in subs[:2]:
+                    try:
+                        books = await _FCB.get_top_books(sub_url, n=10)
+                        for b in books:
+                            t_norm = _norm(b["title"])
+                            if not t_norm:
+                                continue
+                            t_tokens = set(_tokens(b["title"]))
+                            if not (q_tokens & t_tokens):
+                                continue
+                            s = difflib.SequenceMatcher(None, q_norm, t_norm).ratio()
+                            if s >= 0.20:
+                                b = dict(b)
+                                b["score"] = s
+                                b["source"] = "FCB"
+                                candidates.append(b)
+                    except Exception as e:
+                        log.warning("fcb sub fetch %s failed: %s", sub_url, e)
+                        continue
+            except Exception as e:
+                log.warning("fcb cat %s failed: %s", cat_path, e)
+                continue
+    except Exception as e:
+        log.warning("_FCB recommendations failed: %s", e)
+
+    # Sort by score, dedupe by title, return top N
+    candidates.sort(key=lambda b: b["score"], reverse=True)
+    seen_titles = set()
+    out = []
+    for b in candidates:
+        key = _norm(b["title"])
+        if key in seen_titles:
+            continue
+        seen_titles.add(key)
+        out.append(b)
+        if len(out) >= n:
+            break
+    return out
+
+
 async def handle(phone: str, text: str, say) -> bool:
     import database as db
     text = (text or "").strip()
@@ -750,9 +1416,102 @@ async def handle(phone: str, text: str, say) -> bool:
         await say("👋 Cancelled.")
         return True
     state = (await asyncio.to_thread(db.get_user, phone)).get("state") or {}
+    step = state.get("step")
     cands = state.get("cands") or []
     try:
-        if state.get("step") == "pick" and text.isdigit():
+        # ---- TOPIC MODE: main menu (1 = browse by topic, 2 = search by name) ----
+        if step == "menu":
+            if text == "1":
+                await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "cat", "page": 0})
+                await _show_categories(phone, say, page=0)
+                return False
+            if text == "2":
+                await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "ask"})
+                await say("📚 Send me the *book name* (add the author if you know it), or *back* for the menu, *exit* to cancel.")
+                return False
+            await say("🤔 Reply with *1* (browse by topic) or *2* (search by name), or *exit*.")
+            return False
+
+        # ---- TOPIC MODE: category picker (paginated) ----
+        if step == "cat":
+            page = state.get("page", 0)
+            if low == "next":
+                page += 1
+                await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "cat", "page": page})
+                await _show_categories(phone, say, page=page)
+                return False
+            if low == "prev":
+                page = max(0, page - 1)
+                await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "cat", "page": page})
+                await _show_categories(phone, say, page=page)
+                return False
+            if low == "back":
+                await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "menu"})
+                await say(PROMPT)
+                return False
+            if text.isdigit():
+                cats = await _all_categories()
+                n = int(text)
+                if not 1 <= n <= len(cats):
+                    await say(f"🤔 Please reply with a number from 1 to {len(cats)} (or *next* / *back* / *exit*).")
+                    return False
+                cat_name, cat_path, cat_source = cats[n - 1]
+                await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "sub",
+                                                       "cat_name": cat_name, "cat_path": cat_path,
+                                                       "cat_source": cat_source, "page": 0})
+                await _show_subtopics(phone, say, cat_name, cat_path, source=cat_source, page=0)
+                return False
+            await say("🤔 Reply with a category *number* (or *next* / *prev* / *back* / *exit*).")
+            return False
+
+        # ---- TOPIC MODE: subtopic picker (paginated) ----
+        if step == "sub":
+            cat_name = state.get("cat_name", "")
+            cat_path = state.get("cat_path", "")
+            cat_source = state.get("cat_source", "fbc")
+            page = state.get("page", 0)
+            if low == "next":
+                page += 1
+                await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "sub",
+                                                       "cat_name": cat_name, "cat_path": cat_path,
+                                                       "cat_source": cat_source, "page": page})
+                await _show_subtopics(phone, say, cat_name, cat_path, source=cat_source, page=page)
+                return False
+            if low == "prev":
+                page = max(0, page - 1)
+                await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "sub",
+                                                       "cat_name": cat_name, "cat_path": cat_path,
+                                                       "cat_source": cat_source, "page": page})
+                await _show_subtopics(phone, say, cat_name, cat_path, source=cat_source, page=page)
+                return False
+            if low == "back":
+                await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "cat", "page": 0})
+                await _show_categories(phone, say, page=0)
+                return False
+            if text.isdigit():
+                scraper_mod = _FBC if cat_source == "fbc" else _FCB
+                subs = await scraper_mod.get_subtopics(cat_path)
+                n = int(text)
+                if not 1 <= n <= len(subs):
+                    await say(f"🤔 Please reply with a number from 1 to {len(subs)} (or *next* / *back* / *exit*).")
+                    return False
+                sub_name, sub_url = subs[n - 1]
+                if not _quota_ok(phone):
+                    await asyncio.to_thread(_save, phone, {})
+                    await say(f"⏳ You've reached today's limit of {MAX_PER_DAY} books. Please try again tomorrow.")
+                    return True
+                await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "topic_books",
+                                                       "cat_name": cat_name, "sub_name": sub_name, "sub_url": sub_url,
+                                                       "cat_source": cat_source})
+                await _deliver_topic_books(phone, say, cat_name, sub_name, sub_url, source=cat_source)
+                await asyncio.to_thread(_save, phone, {})
+                _log(phone, title=f"{cat_name} / {sub_name}", source="topic_browse")
+                return True
+            await say("🤔 Reply with a subtopic *number* (or *next* / *prev* / *back* / *exit*).")
+            return False
+
+        # ---- NAME SEARCH MODE: pick from previous results ----
+        if step == "pick" and text.isdigit():
             n = int(text)
             if not 1 <= n <= len(cands):
                 await say(f"🤔 Please reply with a number from 1 to {len(cands)} (or *exit*).")
@@ -763,8 +1522,14 @@ async def handle(phone: str, text: str, say) -> bool:
             _log(phone, title=cands[n - 1]["title"], source=cands[n - 1]["source"])
             await say("✅ Done! Send */books* for another book, or */menu* for the menu.")
             return True
+
+        # ---- NAME SEARCH MODE: free text ----
+        if low == "back":
+            await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "menu"})
+            await say(PROMPT)
+            return False
         if len(text) < 2:
-            await say("🤔 Please send the book's name (or *exit*).")
+            await say("🤔 Please send the book's name (or *back* for the menu, *exit* to cancel).")
             return False
         if not _quota_ok(phone):
             await asyncio.to_thread(_save, phone, {})
@@ -797,9 +1562,32 @@ async def handle(phone: str, text: str, say) -> bool:
         gbooks_search = f"https://www.google.com/search?tbm=bks&q={quote_plus(text)}"
         extra += (f"\n\n📚 *Find it at a library near you:* {worldcat}"
                   f"\n🔍 *Search Google Books:* {gbooks_search}")
+        # Try to recommend 5 similar books from the discovery sites (freebookcentre + freecomputerbooks)
+        await say("🔎 Looking for similar books you might like...")
+        try:
+            recs = await _recommend_books(text, n=5)
+        except Exception as e:
+            log.warning("_recommend_books failed: %s", e)
+            recs = []
+        if recs:
+            rec_lines = ["\n\n💡 *Top 5 similar books you might like:*"]
+            for i, r in enumerate(recs, 1):
+                title = r["title"]
+                author = r.get("author", "")
+                src_tag = r.get("source", "")
+                detail = r["detail_url"]
+                line = f"\n*{i}.* {title}"
+                if author and author.lower() not in ("na", "unknown", ""):
+                    line += f" — {author}"
+                if src_tag:
+                    line += f"  ({src_tag})"
+                line += f"\n    {detail}"
+                rec_lines.append(line)
+            extra += "\n".join(rec_lines)
+            extra += "\n\n_These were not in the free legal libraries I check, but you can browse/download them at the source site._"
         await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "ask"})
         await say("😕 I couldn't find a *free, legal* copy of that. It may still be under copyright (then it's only available to buy or borrow).\n"
-                  "Try the exact title (and author), or send another book name, or *exit*." + extra)
+                  "Try the exact title (and author), or send another book name, or *back* for the menu, or *exit*." + extra)
         _log(phone, ok=False, query=text[:80])
         return False
     except Exception:
