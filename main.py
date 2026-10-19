@@ -42,6 +42,7 @@ APP_SECRET = os.getenv("META_APP_SECRET", "").strip()
 import database as db
 import pdf_service
 import chat_pdf  # NEW: /chat_pdf (RAG over a PDF the user sends)
+import books  # NEW: /books (book name -> free legal PDF/EPUB from OpenStax, Gutenberg, OAPEN, Google Books, Internet Archive)
 import notes_utube  # NEW: /utube_notes (YouTube link -> point-wise notes + PDF)
 import quiz  # NEW: /practice (category -> topic -> 20 random MCQs), same job as quiz_service
 import image_service
@@ -222,6 +223,12 @@ async def handle_text(phone: str, text: str):
     # --- /utube_notes: waiting for the YouTube link ---
     if mode == notes_utube.MODE:
         if await notes_utube.handle(phone, text, say=lambda m: wa.text(phone, m)):
+            await wa.menu(phone)
+        return
+
+    # --- /books: waiting for the book name (or a pick from the shortlist) ---
+    if mode == books.MODE:
+        if await books.handle(phone, text, say=lambda m: wa.text(phone, m)):
             await wa.menu(phone)
         return
 
@@ -440,6 +447,11 @@ async def command(phone: str, text: str):
 
     if cmd == "/utube_notes":  # asks for a YouTube link (or uses one given inline), then sends notes + PDF
         if await notes_utube.start(phone, parts[1].strip() if len(parts) > 1 else "", say=lambda m: wa.text(phone, m)):
+            await wa.menu(phone)
+        return
+
+    if cmd == "/books":  # asks for the book name, then sends a free, legal PDF/EPUB
+        if await books.start(phone, parts[1].strip() if len(parts) > 1 else "", say=lambda m: wa.text(phone, m)):
             await wa.menu(phone)
         return
 
