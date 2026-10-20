@@ -2096,8 +2096,6 @@ async def handle(phone: str, text: str, say) -> bool:
                 await say(PROMPT)
                 return False
             if text == "1":
-                await asyncio.to_thread(_save, phone,
-                    {"mode": MODE, "step": "hr_list", "page": 0})
                 await say("🔎 Loading HR interview questions ...")
                 async with httpx.AsyncClient(follow_redirects=True,
                                               headers=HEADERS) as client:
@@ -2105,16 +2103,14 @@ async def handle(phone: str, text: str, say) -> bool:
                 if not items:
                     await say("⚠️ Couldn't load HR questions. Try again, or *back*.")
                     return False
-                # Refresh state from storage (since we just saved a new dict),
-                # then add items and re-save.
-                state = _load(phone)
-                state["items"] = items
-                await asyncio.to_thread(_save, phone, state)
+                # Save complete state in one shot (no reload needed)
+                await asyncio.to_thread(_save, phone, {
+                    "mode": MODE, "step": "hr_list", "page": 0,
+                    "items": items,
+                })
                 await _show_hr_questions(phone, say, items, page=0)
                 return False
             if text == "2":
-                await asyncio.to_thread(_save, phone,
-                    {"mode": MODE, "step": "gd_list", "page": 0})
                 await say("🔎 Loading GD topics ...")
                 async with httpx.AsyncClient(follow_redirects=True,
                                               headers=HEADERS) as client:
@@ -2122,14 +2118,14 @@ async def handle(phone: str, text: str, say) -> bool:
                 if not items:
                     await say("⚠️ Couldn't load GD topics. Try again, or *back*.")
                     return False
-                state = _load(phone)
-                state["items"] = items
-                await asyncio.to_thread(_save, phone, state)
+                # Save complete state in one shot (no reload needed)
+                await asyncio.to_thread(_save, phone, {
+                    "mode": MODE, "step": "gd_list", "page": 0,
+                    "items": items,
+                })
                 await _show_gd_topics(phone, say, items, page=0)
                 return False
             if text == "3":
-                await asyncio.to_thread(_save, phone,
-                    {"mode": MODE, "step": "tech_list", "page": 0})
                 await say("🔎 Loading technical interview topics ...")
                 async with httpx.AsyncClient(follow_redirects=True,
                                               headers=HEADERS) as client:
@@ -2137,9 +2133,11 @@ async def handle(phone: str, text: str, say) -> bool:
                 if not items:
                     await say("⚠️ Couldn't load tech topics. Try again, or *back*.")
                     return False
-                state = _load(phone)
-                state["items"] = items
-                await asyncio.to_thread(_save, phone, state)
+                # Save complete state in one shot (no reload needed)
+                await asyncio.to_thread(_save, phone, {
+                    "mode": MODE, "step": "tech_list", "page": 0,
+                    "items": items,
+                })
                 await _show_tech_topics(phone, say, items, page=0)
                 return False
             await say("🤔 Reply with *1* (HR), *2* (GD), *3* (Technical), "
