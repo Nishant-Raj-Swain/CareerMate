@@ -145,14 +145,14 @@ def _norm(s: str) -> str:
 
 
 # =====================================================================
-#  STEP 1 — University list from pyqonline.com sidebar
+#  STEP 1 — University list from the source site's sidebar
 # =====================================================================
 _UNI_CACHE: dict = {"at": 0.0, "items": []}
 _UNI_TTL = 86400  # 1 day
 
 
 async def _fetch_university_list(client: httpx.AsyncClient) -> list[dict]:
-    """The pyqonline.com homepage embeds a JS array of {url, description} pairs.
+    """The source homepage embeds a JS array of {url, description} pairs.
     That array IS the left sidebar. Parse it once a day and cache."""
     if _UNI_CACHE["items"] and time.time() - _UNI_CACHE["at"] < _UNI_TTL:
         return _UNI_CACHE["items"]
@@ -431,7 +431,7 @@ _TECH_PROMPT = ("💻 *Technical Interview*\n\n"
 
 
 # =====================================================================
-#  SECTION 2 — COMPANY-WISE PYQ  (scraped from IndiaBix)
+#  SECTION 2 — COMPANY-WISE PYQ  (scraped from the source site)
 #
 #  Flow:
 #    1. User types a company name (e.g. "TCS", "Infosys", "Wipro")
@@ -448,7 +448,7 @@ INDIABIX_BASE = "https://www.indiabix.com"
 
 async def _indiabix_search_companies(client: httpx.AsyncClient,
                                       query: str) -> list[tuple[str, str]]:
-    """Fetch the IndiaBix placement-papers index and return companies that
+    """Fetch the placement-papers index and return companies that
     fuzzy-match the user's query. Returns [(company_name, slug), ...]."""
     r = await client.get(f"{INDIABIX_BASE}/placement-papers/", timeout=TIMEOUT)
     r.raise_for_status()
@@ -493,7 +493,7 @@ async def _indiabix_list_company_papers(client: httpx.AsyncClient,
                                          slug: str) -> list[dict]:
     """Fetch the first page of papers for a company. Returns:
     [{title, posted_by, url, hearts}, ...]
-    IndiaBix paginates with /page-N; we only fetch page 1 to keep the bot
+    The source site paginates with /page-N; we only fetch page 1 to keep the bot
     responsive (typically 10 papers per page)."""
     r = await client.get(f"{INDIABIX_BASE}/placement-papers/{slug}/",
                          timeout=TIMEOUT)
@@ -559,7 +559,7 @@ async def _indiabix_fetch_paper_content(client: httpx.AsyncClient,
 
 
 # =====================================================================
-#  SECTION 3 — COMMON INTERVIEW QUESTIONS  (scraped from IndiaBix)
+#  SECTION 3 — COMMON INTERVIEW QUESTIONS  (scraped from the source site)
 #
 #  Three sub-sections:
 #    1. HR Interview       -> https://www.indiabix.com/hr-interview/<topic>/
@@ -644,7 +644,12 @@ async def _indiabix_list_tech_topics(client: httpx.AsyncClient) -> list[tuple[st
 async def _indiabix_list_tech_subtopics(client: httpx.AsyncClient,
                                           topic_url: str) -> list[tuple[str, str]]:
     """For a tech topic page (e.g. /technical/python/), return its sub-topics
-    (e.g. Variables, Data Types, ...)."""
+    (e.g. Variables, Data Types, ...).
+
+    If the topic page has NO sub-topics (i.e., the Q&As are listed directly
+    on the topic page itself, like /technical/dbms-basics/), we return a
+    single-entry list pointing back to the topic URL — so the user can still
+    pick it and we'll scrape the topic page directly for Q&As."""
     r = await client.get(topic_url, timeout=TIMEOUT)
     r.raise_for_status()
     # Sub-topics live inside <ul class="need-ul-filter"> as:
@@ -669,6 +674,17 @@ async def _indiabix_list_tech_subtopics(client: httpx.AsyncClient,
             continue
         seen.add(full_url)
         out.append((text, full_url))
+
+    # Fallback: if no sub-topics found, treat the topic page itself as a Q&A page.
+    # This happens for topics like DBMS Basics, Networking Basics, etc. where
+    # the Q&As are listed directly on the topic page (with pagination).
+    if not out:
+        # Use the topic name (last path segment) as the label
+        topic_name = prefix.rsplit("/", 1)[-1].replace("-", " ").title()
+        out.append((topic_name, topic_url))
+        log.info("pyq: topic %s has no sub-topics — treating topic page "
+                 "as Q&A source", topic_url)
+
     return out
 
 
@@ -711,12 +727,58 @@ async def _indiabix_fetch_discussion_answers(client: httpx.AsyncClient,
 async def _indiabix_fetch_tech_qas(client: httpx.AsyncClient,
                                      subtopic_url: str) -> list[dict]:
     """For a technical sub-topic page (e.g. /technical/python/variables/),
-    extract Q&A pairs. Returns [{qno, question, answer, answer_html}, ...]."""
-    r = await client.get(subtopic_url, timeout=TIMEOUT)
-    r.raise_for_status()
-    html = r.text
-    # Each Q&A is in <div class="bix-tech-qa"> ... </div>
-    # We split by this marker
+    extract Q&A pairs from ALL pages.
+
+    The source site paginates Q&A pages: /technical/python/variables/ (page 1),
+    /technical/python/variables/2 (page 2), ..., /technical/python/variables/N.
+    The first page contains a "Page 1 of N" marker that tells us the total.
+    We iterate through all N pages and combine all Q&As.
+
+    Returns [{qno, question, answer, answer_html}, ...]."""
+    all_qas: list[dict] = []
+    # Start with the base URL (page 1)
+    current_url = subtopic_url.rstrip("/")
+    page_num = 1
+    total_pages = 1  # default; updated after first page is fetched
+
+    while page_num <= total_pages:
+        try:
+            r = await client.get(current_url, timeout=TIMEOUT)
+            r.raise_for_status()
+        except Exception as e:
+            log.warning("pyq fetch page %d failed: %s", page_num, e)
+            break
+
+        html = r.text
+
+        # Detect total pages from "Page X of Y" marker (only on first page)
+        if page_num == 1:
+            pag_m = re.search(r'Page\s+\d+\s+of\s+(\d+)', html, re.IGNORECASE)
+            if pag_m:
+                total_pages = int(pag_m.group(1))
+                log.info("pyq: %s has %d page(s) of Q&A",
+                         subtopic_url, total_pages)
+
+        # Extract Q&A blocks from this page
+        page_qas = _extract_qas_from_html(html)
+        if not page_qas:
+            break  # no more Q&As
+        all_qas.extend(page_qas)
+
+        # Next page
+        page_num += 1
+        if page_num > total_pages:
+            break
+        # Build URL: /technical/python/variables/2  (no trailing slash on base)
+        current_url = f"{subtopic_url.rstrip('/')}/{page_num}"
+        await asyncio.sleep(0.3)  # be polite
+
+    return all_qas
+
+
+def _extract_qas_from_html(html: str) -> list[dict]:
+    """Extract Q&A blocks from a single technical page.
+    Each Q&A is in <div class="bix-tech-qa"> ... </div>."""
     qas = []
     # Use a non-greedy split
     blocks = re.split(r'<div class="bix-tech-qa">', html)
@@ -831,7 +893,7 @@ def _md_to_xml(text: str, mono_font: str) -> str:
 
 def _indiabix_company_papers_to_pdf(company_name: str,
                                       papers: list[dict]) -> bytes | None:
-    """Build a PDF bundling multiple IndiaBix company placement papers.
+    """Build a PDF bundling multiple company placement papers.
     Each paper = {title, posted_by, url, content}."""
     import io
     try:
@@ -865,8 +927,6 @@ def _indiabix_company_papers_to_pdf(company_name: str,
     story.append(Paragraph(_md_to_xml(company_name, mono), st["title"]))
     story.append(Paragraph(f"Placement Papers — {len(papers)} paper(s)", st["subtitle"]))
     story.append(Spacer(1, 6 * mm))
-    story.append(Paragraph('Source: <a href="https://www.indiabix.com">IndiaBix</a>',
-                            st["meta"]))
     story.append(PageBreak())
     for i, p in enumerate(papers, 1):
         story.append(Paragraph(f"{i}. {_md_to_xml(p.get('title', ''), mono)}",
@@ -892,14 +952,13 @@ def _indiabix_company_papers_to_pdf(company_name: str,
         canvas.setFillColor(colors.grey)
         canvas.drawCentredString(A4[0] / 2, 10 * mm, str(doc.page))
         canvas.drawString(15 * mm, 10 * mm, f"{company_name} - Placement Papers")
-        canvas.drawRightString(A4[0] - 15 * mm, 10 * mm, "IndiaBix")
         canvas.restoreState()
     buf = io.BytesIO()
     SimpleDocTemplate(buf, pagesize=A4,
                       leftMargin=15 * mm, rightMargin=15 * mm,
                       topMargin=15 * mm, bottomMargin=18 * mm,
                       title=f"{company_name} Placement Papers",
-                      author="IndiaBix").build(story,
+                      author="").build(story,
                                                 onFirstPage=_footer,
                                                 onLaterPages=_footer)
     return buf.getvalue()
@@ -936,8 +995,6 @@ def _indiabix_discussion_to_pdf(section_name: str, topic: str,
     story = [Spacer(1, 50 * mm)]
     story.append(Paragraph(_md_to_xml(topic, mono), st["title"]))
     story.append(Paragraph(f"{section_name} — {len(answers)} answer(s)", st["subtitle"]))
-    story.append(Paragraph('Source: <a href="https://www.indiabix.com">IndiaBix</a>',
-                            st["subtitle"]))
     story.append(PageBreak())
     for i, ans in enumerate(answers, 1):
         story.append(Paragraph(f"Answer {i}", st["ans_h"]))
@@ -956,14 +1013,13 @@ def _indiabix_discussion_to_pdf(section_name: str, topic: str,
         canvas.setFillColor(colors.grey)
         canvas.drawCentredString(A4[0] / 2, 10 * mm, str(doc.page))
         canvas.drawString(15 * mm, 10 * mm, f"{section_name} - {topic[:40]}")
-        canvas.drawRightString(A4[0] - 15 * mm, 10 * mm, "IndiaBix")
         canvas.restoreState()
     buf = io.BytesIO()
     SimpleDocTemplate(buf, pagesize=A4,
                       leftMargin=15 * mm, rightMargin=15 * mm,
                       topMargin=15 * mm, bottomMargin=18 * mm,
                       title=f"{section_name} - {topic}",
-                      author="IndiaBix").build(story,
+                      author="").build(story,
                                                 onFirstPage=_footer,
                                                 onLaterPages=_footer)
     return buf.getvalue()
@@ -1008,8 +1064,6 @@ def _indiabix_tech_qas_to_pdf(topic_name: str, subtopic_name: str,
     story.append(Paragraph(_md_to_xml(f"{topic_name} - {subtopic_name}", mono),
                             st["title"]))
     story.append(Paragraph(f"Technical Interview — {len(qas)} Q&A", st["subtitle"]))
-    story.append(Paragraph('Source: <a href="https://www.indiabix.com">IndiaBix</a>',
-                            st["subtitle"]))
     story.append(PageBreak())
     for i, qa in enumerate(qas, 1):
         qno = qa.get("qno", str(i)).strip()
@@ -1063,14 +1117,13 @@ def _indiabix_tech_qas_to_pdf(topic_name: str, subtopic_name: str,
         canvas.setFillColor(colors.grey)
         canvas.drawCentredString(A4[0] / 2, 10 * mm, str(doc.page))
         canvas.drawString(15 * mm, 10 * mm, f"{topic_name} - {subtopic_name}"[:50])
-        canvas.drawRightString(A4[0] - 15 * mm, 10 * mm, "IndiaBix")
         canvas.restoreState()
     buf = io.BytesIO()
     SimpleDocTemplate(buf, pagesize=A4,
                       leftMargin=15 * mm, rightMargin=15 * mm,
                       topMargin=15 * mm, bottomMargin=18 * mm,
                       title=f"{topic_name} - {subtopic_name}",
-                      author="IndiaBix").build(story,
+                      author="").build(story,
                                                 onFirstPage=_footer,
                                                 onLaterPages=_footer)
     return buf.getvalue()
@@ -1204,9 +1257,9 @@ async def _show_papers(phone: str, say, papers: list[dict], page: int = 0) -> No
 # =====================================================================
 async def _show_company_papers_list(phone: str, say, company_name: str,
                                        papers: list[dict], page: int = 0) -> None:
-    """Paginated list of IndiaBix placement papers for a company."""
+    """Paginated list of placement papers for a company."""
     if not papers:
-        await say(f"⚠️ No papers found for *{company_name}* on IndiaBix. "
+        await say(f"⚠️ No papers found for *{company_name}*. "
                   f"Try another company, or *back* / *exit*.")
         return
     total_pages = (len(papers) + PAGE_SIZE - 1) // PAGE_SIZE
@@ -1317,7 +1370,6 @@ async def _deliver_papers(phone: str, say, papers: list[dict]) -> int:
                 continue
             size_kb = len(data) / 1024
             caption = (f"📝 {p['name']}\n"
-                       f"🏷 Source: pyqonline.com\n"
                        f"📊 Size: {size_kb:.0f} KB")
             await _send_file(phone, p["name"], data, p["pdf_url"], say, caption)
             delivered += 1
@@ -1356,13 +1408,13 @@ def _parse_paper_selection(text: str, total: int) -> list[int] | None:
 #  Helpers for Section 2 (company search) and 3 (interview fetch + PDF)
 # =====================================================================
 async def _company_fetch_and_show(phone: str, say, company_query: str) -> bool:
-    """Search IndiaBix for the company, fetch the paper list, save state,
+    """Search for the company, fetch the paper list, save state,
     and show the paginated list. Returns True on success."""
-    await say(f"🔎 Searching IndiaBix for *{company_query}* ...")
+    await say(f"🔎 Searching for *{company_query}* ...")
     async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS) as client:
         matches = await _indiabix_search_companies(client, company_query)
     if not matches:
-        await say(f"😕 No company named *{company_query}* found on IndiaBix. "
+        await say(f"😕 No company named *{company_query}* found. "
                   f"Try another name (e.g. 'TCS', 'Infosys', 'Wipro'), or *back* / *exit*.")
         return False
     if len(matches) == 1:
@@ -1389,7 +1441,7 @@ async def _company_fetch_and_show(phone: str, say, company_query: str) -> bool:
     async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS) as client:
         papers = await _indiabix_list_company_papers(client, slug)
     if not papers:
-        await say(f"😕 No papers found for *{company_name}* on IndiaBix. "
+        await say(f"😕 No papers found for *{company_name}*. "
                   f"Try another company, or *back* / *exit*.")
         return False
     await asyncio.to_thread(_save, phone, {
@@ -1407,7 +1459,7 @@ async def _company_deliver_papers(phone: str, say, company_name: str,
                                      papers: list[dict], picked_indices: list[int]) -> None:
     """Fetch content for selected papers, build a single PDF, send via WhatsApp."""
     to_fetch = [papers[i] for i in picked_indices]
-    await say(f"📥 Fetching {len(to_fetch)} paper(s) from IndiaBix ...")
+    await say(f"📥 Fetching {len(to_fetch)} paper(s) ...")
     async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS) as client:
         for i, p in enumerate(to_fetch, 1):
             await say(f"⏳ [{i}/{len(to_fetch)}] {p['title'][:60]} ...")
@@ -1415,7 +1467,7 @@ async def _company_deliver_papers(phone: str, say, company_name: str,
                 content = await _indiabix_fetch_paper_content(client, p["url"])
                 p["content"] = content or "(No content available.)"
             except Exception as e:
-                log.warning("indiabix paper fetch failed: %s", e)
+                log.warning("paper fetch failed: %s", e)
                 p["content"] = f"(Failed to fetch content: {e})"
             await asyncio.sleep(0.3)  # be polite
     await say(f"📄 Generating PDF ...")
@@ -1431,8 +1483,7 @@ async def _company_deliver_papers(phone: str, say, company_name: str,
     size_kb = len(pdf_bytes) / 1024
     caption = (f"📝 {company_name} - Placement Papers\n"
                f"📊 {len(to_fetch)} paper(s)\n"
-               f"📦 Size: {size_kb:.0f} KB\n"
-               f"🏷 Source: IndiaBix")
+               f"📦 Size: {size_kb:.0f} KB")
     await _send_file(phone, f"{company_name}_papers", pdf_bytes,
                       "https://www.indiabix.com/placement-papers/", say, caption)
     await say(f"✅ Sent *{company_name}* ({len(to_fetch)} papers). "
@@ -1460,8 +1511,7 @@ async def _hr_fetch_and_deliver(phone: str, say, question_text: str,
     size_kb = len(pdf_bytes) / 1024
     caption = (f"👤 HR Interview - {question_text[:50]}\n"
                f"📊 {len(answers)} answer(s)\n"
-               f"📦 Size: {size_kb:.0f} KB\n"
-               f"🏷 Source: IndiaBix")
+               f"📦 Size: {size_kb:.0f} KB")
     await _send_file(phone, f"hr_{question_text[:30]}", pdf_bytes, page_url, say, caption)
     await say(f"✅ Sent HR question ({len(answers)} answers). "
               f"Send *back* for more, or */pyq* for the menu.")
@@ -1488,8 +1538,7 @@ async def _gd_fetch_and_deliver(phone: str, say, topic_text: str,
     size_kb = len(pdf_bytes) / 1024
     caption = (f"👥 GD Topic - {topic_text[:50]}\n"
                f"📊 {len(answers)} contribution(s)\n"
-               f"📦 Size: {size_kb:.0f} KB\n"
-               f"🏷 Source: IndiaBix")
+               f"📦 Size: {size_kb:.0f} KB")
     await _send_file(phone, f"gd_{topic_text[:30]}", pdf_bytes, page_url, say, caption)
     await say(f"✅ Sent GD topic ({len(answers)} contributions). "
               f"Send *back* for more, or */pyq* for the menu.")
@@ -1516,8 +1565,7 @@ async def _tech_fetch_and_deliver(phone: str, say, topic_name: str,
     size_kb = len(pdf_bytes) / 1024
     caption = (f"💻 {topic_name} - {subtopic_name}\n"
                f"📊 {len(qas)} Q&A\n"
-               f"📦 Size: {size_kb:.0f} KB\n"
-               f"🏷 Source: IndiaBix")
+               f"📦 Size: {size_kb:.0f} KB")
     await _send_file(phone, f"{topic_name}_{subtopic_name}", pdf_bytes,
                       subtopic_url, say, caption)
     await say(f"✅ Sent *{topic_name} - {subtopic_name}* ({len(qas)} Q&A). "
@@ -1963,7 +2011,7 @@ async def handle(phone: str, text: str, say) -> bool:
             return False
 
         # =============================================================
-        #  STEP: company_pick  (multiple IndiaBix matches)
+        #  STEP: company_pick  (multiple company matches)
         # =============================================================
         if step == "company_pick":
             matches = state.get("matches") or []
@@ -2300,7 +2348,7 @@ async def _cli(argv) -> None:
 
     # Full interactive flow
     print("=" * 60)
-    print("   PYQONLINE.COM  ->  Previous-Year-Question Scraper (CLI)")
+    print("   Previous-Year-Question Scraper (CLI)")
     print("=" * 60)
 
     async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS) as client:
