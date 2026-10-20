@@ -105,6 +105,7 @@ class WhatsApp:
             "🎯 /ats <role> - Evaluate ATS score (e.g. /ats Devops)\n"
             "📄 /chat_pdf - Chat & ask questions with your PDF\n"
             "📚 /books - Discover top career and tech books\n"
+            "📋 /pyq - Practice previous year questions\n"
             "📄 /send - Upload or review your saved resume\n"
             "🔍 /job_search - Search for open job roles\n"
             "📺 /utube_notes - Get detailed notes from a YouTube link\n"
