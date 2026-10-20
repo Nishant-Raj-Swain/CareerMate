@@ -29,7 +29,7 @@ EXIT_WORDS = {"exit", "cancel", "stop", "quit", "/exit", "/cancel"}
 # NOTE: "back" is NOT in EXIT_WORDS — it's handled per-step for navigation.
 
 HUB_URL = "https://www.pyqonline.com/"
-PAGE_SIZE = 1000                                                   # show all items (no 10-item limit)
+PAGE_SIZE = 30                                                    # 30 items per WhatsApp message (WhatsApp-safe)
 
 
 class PyqError(Exception):
@@ -691,21 +691,25 @@ async def _indiabix_list_tech_subtopics(client: httpx.AsyncClient,
 async def _indiabix_fetch_discussion_answers(client: httpx.AsyncClient,
                                                 page_url: str) -> list[str]:
     """For an HR question or GD topic page, extract all user-submitted
-    discussion answers. Returns a list of answer strings."""
+    discussion answers. Returns a list of answer strings.
+
+    The source site paginates discussions (e.g. 64 pages for popular GD topics).
+    We fetch page 1 (which has ~10 answers) and return them. The PDF generator
+    will then pick the top 5."""
     r = await client.get(page_url, timeout=TIMEOUT)
     r.raise_for_status()
     html = r.text
+    answers = []
     # Each answer is in <div class="bix-sun-discussion d-flex flex-column px-2">
     # Inside it: <div class="user-content">TEXT</div>
-    # We extract the user-content text.
-    answers = []
-    # Find all bix-sun-discussion blocks; their content goes until the next
-    # closing </div></div></div> pattern.
-    blocks = re.findall(
-        r'<div class="bix-sun-discussion d-flex flex-column px-2"[^>]*>(.*?)</div>\s*</div>\s*</div>',
-        html, re.DOTALL
-    )
-    for block in blocks:
+    # We split by the opening div tag (similar to tech Q&A extraction).
+    blocks = re.split(r'<div class="bix-sun-discussion d-flex flex-column px-2"', html)
+    for block in blocks[1:]:  # skip the part before the first block
+        # Take up to the next bix-sun-discussion or end of relevant section
+        # (the block ends naturally before the next discussion or a <hr>)
+        end = block.find('<hr>')
+        if end > 0:
+            block = block[:end]
         m = re.search(r'<div class="user-content"[^>]*>(.*?)</div>', block, re.DOTALL)
         if not m:
             continue
@@ -994,9 +998,11 @@ def _indiabix_discussion_to_pdf(section_name: str, topic: str,
     }
     story = [Spacer(1, 50 * mm)]
     story.append(Paragraph(_md_to_xml(topic, mono), st["title"]))
-    story.append(Paragraph(f"{section_name} — {len(answers)} answer(s)", st["subtitle"]))
+    # Limit to top 5 answers (most recent / most upvoted on the source site)
+    top_answers = answers[:5]
+    story.append(Paragraph(f"{section_name} — Top {len(top_answers)} Answer(s)", st["subtitle"]))
     story.append(PageBreak())
-    for i, ans in enumerate(answers, 1):
+    for i, ans in enumerate(top_answers, 1):
         story.append(Paragraph(f"Answer {i}", st["ans_h"]))
         story.append(HRFlowable(width="100%", thickness=0.3,
                                 color=colors.HexColor("#cccccc")))
@@ -1005,7 +1011,7 @@ def _indiabix_discussion_to_pdf(section_name: str, topic: str,
             para = para.strip()
             if para:
                 story.append(Paragraph(_md_to_xml(para, mono), st["body"]))
-        if i < len(answers):
+        if i < len(top_answers):
             story.append(Spacer(1, 6 * mm))
     def _footer(canvas, doc):
         canvas.saveState()
@@ -1510,10 +1516,10 @@ async def _hr_fetch_and_deliver(phone: str, say, question_text: str,
         return
     size_kb = len(pdf_bytes) / 1024
     caption = (f"👤 HR Interview - {question_text[:50]}\n"
-               f"📊 {len(answers)} answer(s)\n"
+               f"📊 Top {min(len(answers), 5)} answer(s)\n"
                f"📦 Size: {size_kb:.0f} KB")
     await _send_file(phone, f"hr_{question_text[:30]}", pdf_bytes, page_url, say, caption)
-    await say(f"✅ Sent HR question ({len(answers)} answers). "
+    await say(f"✅ Sent HR question (top {min(len(answers), 5)} answers). "
               f"Send *back* for more, or */pyq* for the menu.")
 
 
@@ -1537,10 +1543,10 @@ async def _gd_fetch_and_deliver(phone: str, say, topic_text: str,
         return
     size_kb = len(pdf_bytes) / 1024
     caption = (f"👥 GD Topic - {topic_text[:50]}\n"
-               f"📊 {len(answers)} contribution(s)\n"
+               f"📊 Top {min(len(answers), 5)} contribution(s)\n"
                f"📦 Size: {size_kb:.0f} KB")
     await _send_file(phone, f"gd_{topic_text[:30]}", pdf_bytes, page_url, say, caption)
-    await say(f"✅ Sent GD topic ({len(answers)} contributions). "
+    await say(f"✅ Sent GD topic (top {min(len(answers), 5)} contributions). "
               f"Send *back* for more, or */pyq* for the menu.")
 
 
