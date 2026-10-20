@@ -235,9 +235,9 @@ async def handle_text(phone: str, text: str):
 
     #Generate PYQs
     if mode == pyq.MODE:
-    if await pyq.handle(phone, text, say=lambda m: wa.text(phone, m)):
-        await wa.menu(phone)
-    return
+        if await pyq.handle(phone, text, say=lambda m: wa.text(phone, m)):
+            await wa.menu(phone)
+        return
 
     # --- PRACTICE MENU (/practice): user is choosing a category / topic ---
     if mode == quiz.MODE:
