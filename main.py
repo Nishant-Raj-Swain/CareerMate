@@ -53,6 +53,7 @@ import quiz_service
 from news_service import NewsService  # Integrated NewsService
 from opportunities_service import opportunities_service
 from admin_dashboard import router as admin_router
+import PYQ as pyq
 
 wa = None
 ai_service = None
@@ -231,6 +232,12 @@ async def handle_text(phone: str, text: str):
         if await books.handle(phone, text, say=lambda m: wa.text(phone, m)):
             await wa.menu(phone)
         return
+
+    #Generate PYQs
+    if mode == pyq.MODE:
+    if await pyq.handle(phone, text, say=lambda m: wa.text(phone, m)):
+        await wa.menu(phone)
+    return
 
     # --- PRACTICE MENU (/practice): user is choosing a category / topic ---
     if mode == quiz.MODE:
@@ -454,6 +461,12 @@ async def command(phone: str, text: str):
         if await books.start(phone, parts[1].strip() if len(parts) > 1 else "", say=lambda m: wa.text(phone, m)):
             await wa.menu(phone)
         return
+
+    if cmd == "/pyq":                  # ask for PYQs
+        if await pyq.start(phone, parts[1].strip() if len(parts) > 1 else "", say=lambda m: wa.text(phone, m)):
+            await wa.menu(phone)
+        return
+    
 
     if cmd == "/practice":  # browse categories -> topics -> 20 random questions 
         db.save_state(phone, {})
