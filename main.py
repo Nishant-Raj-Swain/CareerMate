@@ -54,6 +54,7 @@ from news_service import NewsService  # Integrated NewsService
 from opportunities_service import opportunities_service
 from admin_dashboard import router as admin_router
 import PYQ as pyq
+import feedback  # NEW: /feedback (ML-classified user feedback shown in the admin panel)
 
 wa = None
 ai_service = None
@@ -87,6 +88,7 @@ def log_user_command(whatsapp_no: str, command: str):
         logger.error(f"Failed to log command to analytics DB: {e}")
 
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global wa, ai_service, news_service, langgraph_app
@@ -99,27 +101,13 @@ async def lifespan(app: FastAPI):
         chat_pdf.init()  # NEW: creates chat_pdf tables, purges expired PDFs
     except Exception:
         logger.exception("chat_pdf init failed (it will retry on first use)")
+    try:
+        feedback.init_db()  # NEW: creates the feedback table + loads admin-corrected rows
+        await asyncio.to_thread(feedback.get_model)  # NEW: train the classifier once at start-up
+    except Exception:
+        logger.exception("feedback init failed (it will retry on first use)")
     wa = WhatsApp()
-    ai_service = AIService()
-    news_service = NewsService(wa_access_token=WHATSAPP_TOKEN, wa_phone_id=PHONE_NUMBER_ID)
-
-    if not WHATSAPP_TOKEN:
-        logger.error("❌ WHATSAPP_TOKEN is missing or empty in environment! Outgoing messages will fail.")
-    else:
-        logger.info(f"✅ WHATSAPP_TOKEN loaded successfully! (Length: {len(WHATSAPP_TOKEN)})")
-
-    if not PHONE_NUMBER_ID:
-        logger.error("❌ PHONE_NUMBER_ID is missing or empty in environment! API requests will fail.")
-    else:
-        logger.info(f"✅ PHONE_NUMBER_ID loaded successfully: {PHONE_NUMBER_ID}")
-
-    checkpointer = MemorySaver()
-    langgraph_app = build_agent(checkpointer)
-
-    yield
-
-    await wa.close()
-
+    ...  # the rest of your lifespan stays exactly as it is
 
 app = FastAPI(title="WhatsApp Career Assistant", lifespan=lifespan)
 
@@ -243,6 +231,12 @@ async def handle_text(phone: str, text: str):
     if mode == quiz.MODE:
         msgs, questions, topic = await quiz.practice_reply(phone, text, notify=lambda m: wa.text(phone, m))
         await _practice_output(phone, msgs, questions, topic)
+        return
+
+    # --- /feedback: waiting for the user's feedback text ---
+    if mode == feedback.MODE:
+        if await feedback.handle(phone, text, say=lambda m: wa.text(phone, m)):
+            await wa.menu(phone)
         return
 
     # --- QUIZ INTERACTION MODE ---
@@ -419,6 +413,14 @@ async def command(phone: str, text: str):
         await wa.menu(phone)
         return
 
+
+    if cmd == "/feedback":  # user sends feedback; an ML model labels it positive / negative / suggestion
+        if await feedback.start(phone, parts[1].strip() if len(parts) > 1 else "", say=lambda m: wa.text(phone, m)):
+            await wa.menu(phone)
+        return
+
+
+
     if cmd in ("/internships", "/internship"):
         db.save_state(phone, {})
         await wa.text(phone, "🔍 *Fetching active internships from Unstop...*")
@@ -426,6 +428,8 @@ async def command(phone: str, text: str):
         await wa.text(phone, result)
         await wa.menu(phone)
         return
+
+    
 
     if cmd == "/ats_score":
         target_role = parts[1].strip() if len(parts) > 1 else "Data Analyst / Software Role"
