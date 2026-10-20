@@ -1,26 +1,4 @@
-"""pyqonline_scraper.py — Previous Year Question papers from pyqonline.com.
 
-Drop-in module for the CareerMate WhatsApp bot (same interface as books.py):
-
-    MODE = "pyq"
-    is_active(state) -> bool
-    async start(phone, arg, say) -> bool       # entry from /pyq [subject]
-    async handle(phone, text, say) -> bool     # continuation while in this mode
-
-State machine (mirrors books.py topic-browse flow):
-    step=menu      1 = browse by university, 2 = quick search by subject
-    step=uni       pick university (paginated 10/page)
-    step=course    pick course (B.Tech / BCA / MCA ...)
-    step=branch    pick branch (CSE / IT / EEE ...) — auto-skipped if none
-    step=filter    ask user for semester + year (one message)
-    step=papers    paginated list of matched papers; reply number / all / next / back
-    step=deliver   download chosen PDF(s) and send via WhatsApp
-
-The module also runs standalone (CLI / Colab):
-
-    python pyqonline_scraper.py                # interactive prompts
-    python pyqonline_scraper.py probe "BPUT"   # debug a university
-"""
 from __future__ import annotations
 
 import asyncio
@@ -407,8 +385,13 @@ PROMPT = ("📝 *Previous Year Questions*\n\nChoose a section:\n"
           "*3.* Common Interview Questions  (DSA, DBMS, OS, Networks, HR ...)\n\n"
           "Reply with *1*, *2*, or *3* (or send *exit* to cancel).")
 
-_UNI_PROMPT = ("📝 *Universities*\n\n"
-               "Send the *number* of a university (or *next* / *prev* / *back* / *exit*):\n\n")
+_UNI_SEARCH_PROMPT = ("📝 *Universities*\n\n"
+                     "Type your *university name* (e.g. *BPUT*, *AKTU*, *BHU*, *Gauhati*) "
+                     "and I'll find the closest matches.\n\n"
+                     "Or send *all* to browse the full list, *back* for menu, *exit* to cancel.")
+_UNI_RESULTS_PROMPT = ("📝 *Universities*\n\n"
+                       "Did you mean:\n\n")
+_UNI_PROMPT = _UNI_SEARCH_PROMPT  # alias for backward compat
 _COURSE_PROMPT = ("📝 *{uni}*\n\n"
                   "Send the *number* of a course (or *next* / *prev* / *back* / *exit*):\n\n")
 _BRANCH_PROMPT = ("📝 *{uni} - {course}*\n\n"
@@ -1562,15 +1545,10 @@ async def handle(phone: str, text: str, say) -> bool:
         # =============================================================
         if step == "menu":
             if text == "1":
-                # Section 1: University PYQ (existing flow)
-                await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "uni", "page": 0})
-                async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS) as client:
-                    items = await _fetch_university_list(client)
-                # Show first page (alphabetical)
-                await _show_universities(phone, say, items, page=0)
-                # Cache the items in state for pagination
-                state["items"] = items
-                await asyncio.to_thread(_save, phone, state)
+                # Section 1: University PYQ — ask user to type university name
+                await asyncio.to_thread(_save, phone,
+                    {"mode": MODE, "step": "uni", "page": 0})
+                await say(_UNI_SEARCH_PROMPT)
                 return False
             if text == "2":
                 # Section 2: Company-wise PYQ — ask user to type a company name
@@ -1589,39 +1567,69 @@ async def handle(phone: str, text: str, say) -> bool:
             return False
 
         # =============================================================
-        #  STEP: uni  (paginated list of universities)
+        #  STEP: uni  (search-first: user types name → show top matches → pick)
+        #  Mirrors the Colab script's main() loop:
+        #    q = ask("Enter university name")
+        #    matches = search_university(items, q)
+        #    show top 8; user picks by number
         # =============================================================
         if step == "uni":
-            items = state.get("items") or []
-            if not items:                              # cache lost (server restart?) -> refetch
-                async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS) as client:
-                    items = await _fetch_university_list(client)
-                state["items"] = items
-
-            page = state.get("page", 0)
-            if low == "next":
-                page += 1
-                state["page"] = page
-                await asyncio.to_thread(_save, phone, state)
-                await _show_universities(phone, say, items, page=page)
-                return False
-            if low == "prev":
-                page = max(0, page - 1)
-                state["page"] = page
-                await asyncio.to_thread(_save, phone, state)
-                await _show_universities(phone, say, items, page=page)
-                return False
+            # Navigation keywords
             if low == "back":
                 await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "menu"})
                 await say(PROMPT)
                 return False
+
+            # If user previously asked for a search and we cached matches,
+            # a digit picks from those matches. Otherwise, free text = new search.
+            cached_matches = state.get("uni_matches") or []
+
+            # Handle 'all' → browse full list (paginated)
+            if low == "all":
+                await say("🔎 Loading all universities ...")
+                async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS) as client:
+                    items = await _fetch_university_list(client)
+                state["items"] = items
+                state["page"] = 0
+                state.pop("uni_matches", None)
+                await asyncio.to_thread(_save, phone, state)
+                await _show_universities(phone, say, items, page=0)
+                return False
+
+            # Paginate the full list (only after 'all')
+            if low in ("next", "prev") and state.get("items"):
+                items = state.get("items") or []
+                page = state.get("page", 0)
+                if low == "next":
+                    page += 1
+                else:
+                    page = max(0, page - 1)
+                state["page"] = page
+                await asyncio.to_thread(_save, phone, state)
+                await _show_universities(phone, say, items, page=page)
+                return False
+
+            # Digit → pick from cached matches (or full list if 'all' was used)
             if text.isdigit():
                 n = int(text)
-                if not 1 <= n <= len(items):
-                    await say(f"🤔 Please reply with a number from 1 to {len(items)} "
-                              f"(or *next* / *back* / *exit*).")
-                    return False
-                it = items[n - 1]
+                if cached_matches:
+                    if not 1 <= n <= len(cached_matches):
+                        await say(f"🤔 Reply 1-{len(cached_matches)}, "
+                                  f"or type another university name, or *back* / *exit*.")
+                        return False
+                    it = cached_matches[n - 1]
+                else:
+                    items = state.get("items") or []
+                    if not items:
+                        await say("🤔 Type your university name first, or *all* to browse, "
+                                  "or *back* / *exit*.")
+                        return False
+                    if not 1 <= n <= len(items):
+                        await say(f"🤔 Reply 1-{len(items)}, or type a university name, "
+                                  f"or *back* / *exit*.")
+                        return False
+                    it = items[n - 1]
+
                 uni_url = it["url"] if it["url"].startswith("http") else "https://" + it["url"]
                 uni_name = it["description"][:60]
                 await say(f"🔎 Loading courses for *{uni_name}* ...")
@@ -1638,15 +1646,76 @@ async def handle(phone: str, text: str, say) -> bool:
                 })
                 await _show_courses(phone, say, uni_name, uni_url, courses, page=0)
                 return False
-            # Free text -> fuzzy search within the university list
-            filtered = _search_universities(items, text, limit=30)
-            if not filtered:
-                await say(f"🤔 No university matches *{text}*. Try another name, or *back*.")
+
+            # Free text → search (mirrors Colab's `search_university(items, q)`)
+            if not text or len(text) < 2:
+                await say("🤔 Please type your university name (e.g. *BPUT*, *AKTU*, *BHU*), "
+                          "or *all* to browse, or *back* / *exit*.")
                 return False
-            state["items"] = filtered
-            state["page"] = 0
+
+            await say(f"🔎 Searching for *{text}* ...")
+            async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS) as client:
+                items = await _fetch_university_list(client)
+            matches = _search_universities(items, text, limit=8)
+
+            if not matches:
+                # No match — try to recommend similar (top 5 by loose match)
+                loose = []
+                qtokens = _norm(text).split()
+                for it in items:
+                    d = _norm(it["description"])
+                    if any(t in d for t in qtokens):
+                        loose.append(it)
+                if loose:
+                    top5 = loose[:5]
+                    state["uni_matches"] = top5
+                    state.pop("items", None)
+                    await asyncio.to_thread(_save, phone, state)
+                    lines = [f"😕 No exact match for *{text}*.\n"]
+                    lines.append("Did you mean one of these?\n")
+                    for i, it in enumerate(top5, 1):
+                        lines.append(f"*{i}.* {it['description'][:90]}")
+                    lines.append("\nType a *number* to pick, or send another name, "
+                                 "or *all* to browse, or *back* / *exit*.")
+                    await say("\n".join(lines))
+                else:
+                    await say(f"😕 No university matches *{text}*. "
+                              f"Try another name (e.g. *BPUT*, *AKTU*, *BHU*), "
+                              f"or *all* to browse, or *back* / *exit*.")
+                return False
+
+            # Single exact match → go straight to courses
+            if len(matches) == 1:
+                it = matches[0]
+                uni_url = it["url"] if it["url"].startswith("http") else "https://" + it["url"]
+                uni_name = it["description"][:60]
+                await say(f"✅ Found: *{uni_name}*. Loading courses ...")
+                async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS) as client:
+                    courses = await _list_courses(client, uni_url)
+                if not courses:
+                    await say(f"⚠️ Couldn't detect courses on *{uni_name}*. "
+                              f"Try another university, or *back*.")
+                    return False
+                await asyncio.to_thread(_save, phone, {
+                    "mode": MODE, "step": "course",
+                    "uni_name": uni_name, "uni_url": uni_url,
+                    "courses": courses, "page": 0,
+                })
+                await _show_courses(phone, say, uni_name, uni_url, courses, page=0)
+                return False
+
+            # Multiple matches → show top 8 and ask user to pick (mirrors Colab)
+            top = matches[:8]
+            state["uni_matches"] = top
+            state.pop("items", None)
             await asyncio.to_thread(_save, phone, state)
-            await _show_universities(phone, say, filtered, page=0)
+            lines = [f"🔍 Found *{len(matches)}* match(es) for *{text}*.\n"]
+            lines.append("Pick one:\n")
+            for i, it in enumerate(top, 1):
+                lines.append(f"*{i}.* {it['description'][:90]}")
+            lines.append("\nType a *number* to pick, or send another name, "
+                         "or *all* to browse, or *back* / *exit*.")
+            await say("\n".join(lines))
             return False
 
         # =============================================================
