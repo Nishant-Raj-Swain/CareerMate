@@ -29,7 +29,7 @@ EXIT_WORDS = {"exit", "cancel", "stop", "quit", "/exit", "/cancel"}
 # NOTE: "back" is NOT in EXIT_WORDS — it's handled per-step for navigation.
 
 HUB_URL = "https://www.pyqonline.com/"
-PAGE_SIZE = 10                                                    # 10 items per WhatsApp message
+PAGE_SIZE = 1000                                                   # show all items (no 10-item limit)
 
 
 class PyqError(Exception):
