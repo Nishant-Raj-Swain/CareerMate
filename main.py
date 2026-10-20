@@ -107,7 +107,25 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.exception("feedback init failed (it will retry on first use)")
     wa = WhatsApp()
-    ...  # the rest of your lifespan stays exactly as it is
+    ai_service = AIService()
+    news_service = NewsService(wa_access_token=WHATSAPP_TOKEN, wa_phone_id=PHONE_NUMBER_ID)
+
+    if not WHATSAPP_TOKEN:
+        logger.error("❌ WHATSAPP_TOKEN is missing or empty in environment! Outgoing messages will fail.")
+    else:
+        logger.info(f"✅ WHATSAPP_TOKEN loaded successfully! (Length: {len(WHATSAPP_TOKEN)})")
+
+    if not PHONE_NUMBER_ID:
+        logger.error("❌ PHONE_NUMBER_ID is missing or empty in environment! API requests will fail.")
+    else:
+        logger.info(f"✅ PHONE_NUMBER_ID loaded successfully: {PHONE_NUMBER_ID}")
+
+    checkpointer = MemorySaver()
+    langgraph_app = build_agent(checkpointer)
+
+    yield
+
+    await wa.close()
 
 app = FastAPI(title="WhatsApp Career Assistant", lifespan=lifespan)
 
