@@ -110,7 +110,7 @@ class WhatsApp:
             "🔍 /job_search - Search for open job roles\n"
             "📺 /utube_notes - Get detailed notes from a YouTube link\n"
             "🗺️ /roadmap <topic> - Get an official/AI roadmap\n"
-            "💬 /assistance - Ask any career question\n"
+            "💬 /assistance - Ask any question\n"
             "🚫 /cancel - Exit active quiz or operation\n"
             "🗑️ /delete - Clear saved session & uploaded resume\n"
             "💬 /feedback - Share your feedback \n\n"
