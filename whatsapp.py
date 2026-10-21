@@ -113,7 +113,7 @@ class WhatsApp:
             "💬 /assistance - Ask any career question\n"
             "🚫 /cancel - Exit active quiz or operation\n"
             "🗑️ /delete - Clear saved session & uploaded resume\n"
-            "💬 /feedback - Share your feedback or report an issue or give any suggestion\n\n"
+            "💬 /feedback - Share your feedback n\n"
             "Reply with any command to get started!"
         )
         await self.text(to, menu_text)
