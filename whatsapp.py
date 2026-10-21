@@ -97,14 +97,14 @@ class WhatsApp:
 
     async def menu(self, to: str):
         menu_text = (
-            "🤖 *Career Assistant Command Menu*\n\n"
-            "⚡ /news - Get today's top tech news cards\n"
-            "🏆 /competitions - Latest tech competitions\n"
+            "🤖 *CareerMate Command Menu*\n\n"
+            "⚡ /news - Get today's top tech news\n"
+            "🏆 /competitions - Latest competitions\n"
             "💼 /internships - Latest internships\n"
             "📝 /practice - helps to Practice quiz \n"
             "🎯 /ats <role> - Evaluate ATS score (e.g. /ats Devops)\n"
             "📄 /chat_pdf - Chat & ask questions with your PDF\n"
-            "📚 /books - Discover top career and tech books\n"
+            "📚 /books - Discover top tech books\n"
             "📋 /pyq - Practice previous year questions\n"
             "📄 /send - Upload or review your saved resume\n"
             "🔍 /job_search - Search for open job roles\n"
@@ -113,7 +113,7 @@ class WhatsApp:
             "💬 /assistance - Ask any career question\n"
             "🚫 /cancel - Exit active quiz or operation\n"
             "🗑️ /delete - Clear saved session & uploaded resume\n"
-            "💬 /feedback - Share your feedback n\n"
+            "💬 /feedback - Share your feedback \n\n"
             "Reply with any command to get started!"
         )
         await self.text(to, menu_text)
