@@ -16,6 +16,8 @@ from pydantic import BaseModel, Field
 
 import auth
 import analytics
+import feedback
+import learning_analytics
 import settings_store
 
 router = APIRouter()
@@ -250,6 +252,59 @@ async def get_user_detail(phone: str, days: int = 30, _: str = Depends(require_a
 @router.get("/api/analytics/system")
 async def get_system(logs: int = 5, _: str = Depends(require_admin)):
     return analytics.system_metrics(log_limit=logs)
+
+
+# --- Feedback (ML-classified user feedback; see feedback.py) ---
+class ResolveBody(BaseModel):
+    id: int
+    resolved: bool = True
+
+
+class RelabelBody(BaseModel):
+    id: int
+    label: str
+
+
+@router.get("/api/analytics/learning/notes")
+async def get_learning_notes(start: str = None, end: str = None, _: str = Depends(require_admin)):
+    return learning_analytics.notes_page(start, end)
+
+
+@router.get("/api/analytics/learning/chat-pdf")
+async def get_learning_chat_pdf(start: str = None, end: str = None, _: str = Depends(require_admin)):
+    return learning_analytics.chat_pdf_page(start, end)
+
+
+@router.get("/api/analytics/learning/pyq")
+async def get_learning_pyq(start: str = None, end: str = None, _: str = Depends(require_admin)):
+    return learning_analytics.pyq_page(start, end)
+
+
+@router.get("/api/analytics/learning/books")
+async def get_learning_books(start: str = None, end: str = None, _: str = Depends(require_admin)):
+    return learning_analytics.books_page(start, end)
+
+
+@router.get("/api/analytics/feedback/page")
+async def get_feedback_page(start: str = None, end: str = None, _: str = Depends(require_admin)):
+    return feedback.page(start, end)
+
+
+@router.post("/api/analytics/feedback/resolve")
+async def post_feedback_resolve(body: ResolveBody, _: str = Depends(require_admin)):
+    if not feedback.set_resolved(body.id, body.resolved):
+        raise HTTPException(status_code=404, detail="Feedback not found")
+    return {"ok": True}
+
+
+@router.post("/api/analytics/feedback/relabel")
+async def post_feedback_relabel(body: RelabelBody, _: str = Depends(require_admin)):
+    try:
+        if not feedback.relabel(body.id, body.label):
+            raise HTTPException(status_code=404, detail="Feedback not found")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return {"ok": True}
 
 
 # --- Admin panel settings (display preferences only — never real secrets) ---
