@@ -131,4 +131,5 @@ class NewsService:
         for item in articles:
             caption = f"📰 *{item['title']}*\n\n🔗 *Read full story:* {item['link']}"
             await self.send_whatsapp_media_card(recipient_phone, item["image_url"], caption)
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(1.5)                                 # image cards download slower than text; spacing keeps the order
+        await asyncio.sleep(3.0)                                     # let the last image card land before main.py sends the menu
