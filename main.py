@@ -42,7 +42,6 @@ APP_SECRET = os.getenv("META_APP_SECRET", "").strip()
 import database as db
 import pdf_service
 import chat_pdf  # NEW: /chat_pdf (RAG over a PDF the user sends)
-import feedback  # NEW: /feedback (ML-classified user feedback shown in the admin panel)
 import books  # NEW: /books (topic wise / book name -> PDF from freebookcentre.net + freecomputerbooks.com)
 import notes_utube  # NEW: /utube_notes (YouTube link -> point-wise notes + PDF)
 import quiz  # NEW: /practice (category -> topic -> 20 random MCQs), same job as quiz_service
@@ -54,6 +53,8 @@ import quiz_service
 from news_service import NewsService  # Integrated NewsService
 from opportunities_service import opportunities_service
 from admin_dashboard import router as admin_router
+import PYQ as pyq
+import feedback  # NEW: /feedback (ML-classified user feedback shown in the admin panel)
 
 wa = None
 ai_service = None
@@ -87,6 +88,7 @@ def log_user_command(whatsapp_no: str, command: str):
         logger.error(f"Failed to log command to analytics DB: {e}")
 
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global wa, ai_service, news_service, langgraph_app
@@ -94,16 +96,16 @@ async def lifespan(app: FastAPI):
     db.initialize()
     init_auth_db()  # Initialized auth tables on app startup
     analytics.init_analytics_db()  # NEW: creates analytics_events if missing
-    try:
-        feedback.init_db()  # NEW: feedback table + corrected rows for the classifier
-        await asyncio.to_thread(feedback.get_model)  # train once at start-up so the first /feedback is instant
-    except Exception:
-        logging.getLogger("feedback").exception("feedback init failed")
     settings_store.init_settings_db()  # NEW: creates admin_settings if missing
     try:
         chat_pdf.init()  # NEW: creates chat_pdf tables, purges expired PDFs
     except Exception:
         logger.exception("chat_pdf init failed (it will retry on first use)")
+    try:
+        feedback.init_db()  # NEW: creates the feedback table + loads admin-corrected rows
+        await asyncio.to_thread(feedback.get_model)  # NEW: train the classifier once at start-up
+    except Exception:
+        logger.exception("feedback init failed (it will retry on first use)")
     wa = WhatsApp()
     ai_service = AIService()
     news_service = NewsService(wa_access_token=WHATSAPP_TOKEN, wa_phone_id=PHONE_NUMBER_ID)
@@ -124,7 +126,6 @@ async def lifespan(app: FastAPI):
     yield
 
     await wa.close()
-
 
 app = FastAPI(title="WhatsApp Career Assistant", lifespan=lifespan)
 
@@ -232,15 +233,15 @@ async def handle_text(phone: str, text: str):
             await wa.menu(phone)
         return
 
-    # --- /feedback: waiting for the user's feedback text ---
-    if mode == feedback.MODE:
-        if await feedback.handle(phone, text, say=lambda m: wa.text(phone, m)):
-            await wa.menu(phone)
-        return
-
     # --- /books: waiting for the book name (or a pick from the shortlist) ---
     if mode == books.MODE:
         if await books.handle(phone, text, say=lambda m: wa.text(phone, m)):
+            await wa.menu(phone)
+        return
+
+    #Generate PYQs
+    if mode == pyq.MODE:
+        if await pyq.handle(phone, text, say=lambda m: wa.text(phone, m)):
             await wa.menu(phone)
         return
 
@@ -248,6 +249,12 @@ async def handle_text(phone: str, text: str):
     if mode == quiz.MODE:
         msgs, questions, topic = await quiz.practice_reply(phone, text, notify=lambda m: wa.text(phone, m))
         await _practice_output(phone, msgs, questions, topic)
+        return
+
+    # --- /feedback: waiting for the user's feedback text ---
+    if mode == feedback.MODE:
+        if await feedback.handle(phone, text, say=lambda m: wa.text(phone, m)):
+            await wa.menu(phone)
         return
 
     # --- QUIZ INTERACTION MODE ---
@@ -424,6 +431,14 @@ async def command(phone: str, text: str):
         await wa.menu(phone)
         return
 
+
+    if cmd == "/feedback":  # user sends feedback; an ML model labels it positive / negative / suggestion
+        if await feedback.start(phone, parts[1].strip() if len(parts) > 1 else "", say=lambda m: wa.text(phone, m)):
+            await wa.menu(phone)
+        return
+
+
+
     if cmd in ("/internships", "/internship"):
         db.save_state(phone, {})
         await wa.text(phone, "🔍 *Fetching active internships from Unstop...*")
@@ -432,7 +447,9 @@ async def command(phone: str, text: str):
         await wa.menu(phone)
         return
 
-    if cmd == "/ats_score":
+    
+
+    if cmd in ("/ats_score", "/ats"):
         target_role = parts[1].strip() if len(parts) > 1 else "Data Analyst / Software Role"
         user = db.get_user(phone)
         existing_resume = user.get("resume")
@@ -462,15 +479,16 @@ async def command(phone: str, text: str):
             await wa.menu(phone)
         return
 
-    if cmd == "/feedback":  # user sends feedback; an ML model labels it positive / negative / suggestion
-        if await feedback.start(phone, parts[1].strip() if len(parts) > 1 else "", say=lambda m: wa.text(phone, m)):
-            await wa.menu(phone)
-        return
-
-    if cmd == "/books":  # menu: topic wise or book name, then sends free PDFs
+    if cmd == "/books":  # asks for the book name, then sends a free, legal PDF/EPUB
         if await books.start(phone, parts[1].strip() if len(parts) > 1 else "", say=lambda m: wa.text(phone, m)):
             await wa.menu(phone)
         return
+
+    if cmd == "/pyq":                  # ask for PYQs
+        if await pyq.start(phone, parts[1].strip() if len(parts) > 1 else "", say=lambda m: wa.text(phone, m)):
+            await wa.menu(phone)
+        return
+    
 
     if cmd == "/practice":  # browse categories -> topics -> 20 random questions 
         db.save_state(phone, {})
