@@ -33,7 +33,7 @@ DB_NAME = "postgres"
 # Commands considered "a feature" vs plumbing commands, used by the funnel
 CAREER_FEATURE_COMMANDS = {
     "/news", "/competitions", "/competition", "/internships", "/internship",
-    "/prepare", "/job_search", "/roadmap", "/send", "/assistance", "/ats_score",
+    "/prepare", "/job_search", "/roadmap", "/send", "/assistance", "/ats", "/ats_score",  # "/ats_score" = old rows logged before the rename
 }
 
 # ---------------------------------------------------------------------------
@@ -193,7 +193,7 @@ SELECT 1000000000 + q.id, q.user_phone, 'quiz_complete', '/quiz',
                     WHERE x.user_phone = q.user_phone AND x.event_type = 'quiz_complete'
                       AND abs(extract(epoch FROM (x.timestamp - q.timestamp))) < 120)
 UNION ALL
-SELECT 2000000000 + r.id, r.user_phone, 'ats_score', '/ats_score',
+SELECT 2000000000 + r.id, r.user_phone, 'ats_score', '/ats',
        json_build_object('score', r.ats_score, 'analysis_type', r.analysis_type)::text,
        1, NULL::float8, to_char(r.timestamp AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')
   FROM resume_analytics r
@@ -1175,7 +1175,7 @@ def system_metrics(log_limit: int = 5):
 
 DASHBOARD_CAREER_COMMANDS = (
     "/competitions", "/competition", "/internships", "/internship",
-    "/prepare", "/job_search", "/roadmap", "/ats_score",
+    "/prepare", "/job_search", "/roadmap", "/ats", "/ats_score",  # old name kept for history
 )
 
 
