@@ -449,7 +449,7 @@ async def command(phone: str, text: str):
 
     
 
-    if cmd in ("/ats_score", "/ats"):
+    if cmd == "/ats":
         target_role = parts[1].strip() if len(parts) > 1 else "Data Analyst / Software Role"
         user = db.get_user(phone)
         existing_resume = user.get("resume")
