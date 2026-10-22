@@ -1,26 +1,4 @@
-"""pyqonline_scraper.py — Previous Year Question papers skill module.
 
-Drop-in module for the CareerMate WhatsApp bot (same interface as books.py):
-
-    MODE = "pyq"
-    is_active(state) -> bool
-    async start(phone, arg, say) -> bool       # entry from /pyq [subject]
-    async handle(phone, text, say) -> bool     # continuation while in this mode
-
-State machine (mirrors books.py topic-browse flow):
-    step=menu      1 = browse by university, 2 = quick search by subject
-    step=uni       pick university (paginated 10/page)
-    step=course    pick course (B.Tech / BCA / MCA ...)
-    step=branch    pick branch (CSE / IT / EEE ...) — auto-skipped if none
-    step=filter    ask user for semester + year (one message)
-    step=papers    paginated list of matched papers; reply number / all / next / back
-    step=deliver   download chosen PDF(s) and send via WhatsApp
-
-The module also runs standalone (CLI / Colab):
-
-    python pyqonline_scraper.py                # interactive prompts
-    python pyqonline_scraper.py probe "BPUT"   # debug a university
-"""
 from __future__ import annotations
 
 import asyncio
@@ -46,7 +24,7 @@ UA = os.getenv("PYQ_UA") or "CareerMateBot/1.0 (educational WhatsApp bot; previo
 HEADERS = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
 MAX_MB = float(os.getenv("PYQ_MAX_MB", "45"))                    # larger files -> send link instead
 MAX_PER_DAY = int(os.getenv("PYQ_MAX_PER_DAY", "10"))
-TIMEOUT = float(os.getenv("PYQ_TIMEOUT", "20"))
+TIMEOUT = float(os.getenv("PYQ_TIMEOUT", "30"))
 EXIT_WORDS = {"exit", "cancel", "stop", "quit", "/exit", "/cancel"}
 # NOTE: "back" is NOT in EXIT_WORDS — it's handled per-step for navigation.
 
@@ -178,21 +156,13 @@ async def _fetch_university_list(client: httpx.AsyncClient) -> list[dict]:
     That array IS the left sidebar. Parse it once a day and cache."""
     if _UNI_CACHE["items"] and time.time() - _UNI_CACHE["at"] < _UNI_TTL:
         return _UNI_CACHE["items"]
-    try:
-        r = await client.get(HUB_URL, timeout=TIMEOUT)
-    except Exception as e:
-        log.error("pyq: cannot reach %s: %r", HUB_URL, e)
-        raise PyqError(f"cannot reach source site: {e!r}")
-    if r.status_code != 200:
-        log.error("pyq: %s answered HTTP %s, body starts: %r", HUB_URL, r.status_code, r.text[:200])
-        raise PyqError(f"source site answered HTTP {r.status_code}")
+    r = await client.get(HUB_URL, timeout=TIMEOUT)
+    r.raise_for_status()
     pattern = re.compile(
         r'\{\s*url:\s*"([^"]+)"\s*,\s*description:\s*"([^"]+)"\s*\}',
         re.IGNORECASE,
     )
     items = [{"url": u, "description": d} for u, d in pattern.findall(r.text)]
-    if not items:
-        log.error("pyq: no university list found in the page (layout changed or blocked); body starts: %r", r.text[:200])
     items = [it for it in items
              if any(k in it["description"].upper()
                     for k in ("UNIVERSITY", "INSTITUTE", "COLLEGE", "VIDYAPEETH"))]
@@ -1738,8 +1708,26 @@ async def handle(phone: str, text: str, say) -> bool:
                 return False
 
             await say(f"🔎 Searching for *{text}* ...")
-            async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS) as client:
-                items = await _fetch_university_list(client)
+            try:
+                async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS) as client:
+                    items = await _fetch_university_list(client)
+            except httpx.TimeoutException:
+                await say("⏳ The university list took too long to load. "
+                          "Please try again, or type *back* / *exit*.")
+                return False
+            except httpx.HTTPError as e:
+                await say(f"⚠️ Couldn't reach the university database ({type(e).__name__}). "
+                          f"Please try again in a minute, or type *back* / *exit*.")
+                return False
+            except Exception as e:
+                log.exception("uni search fetch failed")
+                await say(f"⚠️ Error loading universities: {e}. "
+                          f"Try again, or *back* / *exit*.")
+                return False
+            if not items:
+                await say("⚠️ No universities found in the database. "
+                          "Try *back* / *exit*.")
+                return False
             matches = _search_universities(items, text, limit=8)
 
             if not matches:
