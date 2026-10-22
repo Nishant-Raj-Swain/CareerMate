@@ -1,5 +1,4 @@
 
-
 from __future__ import annotations
 
 import asyncio
@@ -485,19 +484,24 @@ def _send_document_sync(phone: str, data: bytes, filename: str, caption: str) ->
 
 async def deliver(phone: str, b: dict) -> bool:
     """Find the book's PDF and send it as a document. True only if a real PDF was sent."""
+    located = False
     for url in await resolve_pdfs(b):
         data, why = await asyncio.to_thread(_download_sync, url)
         if not data:
             log.info("no PDF from %s: %s", url, why)
             continue
+        located = True
         caption = (f"📚 *{b['title']}*" + (f"\n✍️ {b['author']}" if b.get("author") else "") + (f"\n📄 {b['pages']} pages" if b.get("pages") else "") +
                    f"\n🏷 Listed on {SITES[b['site']]['name']} - free for personal, non-commercial use.")
         try:
             await asyncio.to_thread(_send_document_sync, phone, data, _safe_filename(b["title"]), caption)
+            _log(phone, stage="book", title=b["title"], located=True)
             return True
         except Exception:
             log.exception("document send failed for %s", b["title"])
+            _log(phone, ok=False, stage="book", title=b["title"], located=True)
             return False
+    _log(phone, ok=False, stage="book", title=b["title"], located=located)
     return False
 
 
@@ -624,7 +628,9 @@ def _numbered(items: list[dict]) -> str:
 
 async def start(phone: str, arg: str, say) -> bool:
     """/books [book name]. True = the job is over (state cleared)."""
+    _log(phone, stage="start")
     if arg and arg.strip():
+        _log(phone, stage="method", method="name")
         await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "ask"})
         return await handle(phone, arg, say)
     await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "menu"})
@@ -639,12 +645,15 @@ async def _show_categories(phone: str, say) -> bool:
     return False
 
 
-async def _send_top_books(phone: str, name: str, urls: list[str], say) -> bool:
-    """Sends up to 5 books as PDFs. True if at least one PDF went out."""
+async def _send_top_books(phone: str, name: str, urls: list[str], say, meta: dict | None = None) -> int:
+    """Sends up to 5 books as PDFs. Returns how many PDFs went out (0 = none)."""
+    meta = meta or {}
     books = await get_books(urls)
+    _log(phone, ok=bool(books), stage="results", method="topic", found=len(books), **meta)
     if not books:
+        _log(phone, ok=False, stage="none", method="topic", **meta)
         await say(f"😕 I couldn't read any books under *{name}* right now. Pick another (*0* = back).")
-        return False
+        return 0
     await say(f"⏳ Getting the top books on *{name}*. Each PDF takes a few seconds...")
     sent = 0
     for b in books[:14]:
@@ -653,11 +662,13 @@ async def _send_top_books(phone: str, name: str, urls: list[str], say) -> bool:
         if await deliver(phone, b):
             sent += 1
     if not sent:
+        _log(phone, ok=False, stage="none", method="topic", **meta)
         await say("😕 None of those books has a downloadable PDF right now. Please try another sub-topic (*0* = back).")
-        return False
+        return 0
     if sent < 5:
         await say(f"ℹ️ Only {sent} book(s) on this topic have a downloadable PDF right now.")
-    return True
+    _log(phone, stage="deliver", method="topic", sent=sent, **meta)
+    return sent
 
 
 def _limit_msg() -> str:
@@ -684,6 +695,7 @@ async def handle(phone: str, text: str, say) -> bool:
         if text == "0" and step in ("cat", "ask", "pick"):
             await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "menu"}); await say(MENU); return False
         if step == "menu" and text in ("1", "2"):
+            _log(phone, stage="method", method="topic" if text == "1" else "name")
             if text == "1":
                 return await _show_categories(phone, say)
             await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "ask"}); await say(ASK); return False
@@ -713,10 +725,11 @@ async def handle(phone: str, text: str, say) -> bool:
                 await say("🤔 Please reply *1* or *2* (or *exit*)."); return False
             if not _quota_ok(phone):
                 await asyncio.to_thread(_save, phone, {}); await say(_limit_msg()); return True
-            if not await _send_top_books(phone, target[0], target[1], say):
+            meta = {"category": state.get("cat") or target[0], "subtopic": target[0]}
+            _log(phone, stage="select", method="topic", **meta)
+            if not await _send_top_books(phone, target[0], target[1], say, meta):
                 _refund(phone); return False
             await asyncio.to_thread(_save, phone, {})
-            _log(phone, topic=state.get("cat", ""), subtopic=target[0])
             await say(DONE)
             return True
         if step == "pick" and text.isdigit():
@@ -726,7 +739,8 @@ async def handle(phone: str, text: str, say) -> bool:
             b = cands[int(text) - 1]
             await say(f"⏳ Getting *{b['title']}*...")
             if await deliver(phone, b):
-                await asyncio.to_thread(_save, phone, {}); _log(phone, title=b["title"]); await say(DONE); return True
+                await asyncio.to_thread(_save, phone, {}); _log(phone, stage="deliver", method="name", title=b["title"], via="alternative", category=state.get("topic", ""), sent=1)
+                await say(DONE); return True
             await say("😕 That book has no downloadable PDF right now. Please pick another number from the list.")
             return False
         if step in ("menu", "cat", "sub") and (text.isdigit() or len(text) < 3):
@@ -737,23 +751,26 @@ async def handle(phone: str, text: str, say) -> bool:
         if not _quota_ok(phone):
             await asyncio.to_thread(_save, phone, {}); await say(_limit_msg()); return True
         await say(f"🔎 Looking for *{text[:80]}* (the first search can take a minute)...")
+        _log(phone, stage="query", method="name", query=text[:80])
         books, topic = await search(text)
+        _log(phone, ok=bool(books), stage="results", method="name", query=text[:80], category=topic or "", found=len(books))
         if books and books[0]["score"] >= STRONG and (len(books) == 1 or books[1]["score"] <= books[0]["score"] - 0.06):
             top = books[0]
             await say(f"✅ Found: *{top['title']}*. Sending the PDF...")
             if await deliver(phone, top):
-                await asyncio.to_thread(_save, phone, {}); _log(phone, title=top["title"], query=text[:80]); await say(DONE); return True
+                await asyncio.to_thread(_save, phone, {}); _log(phone, stage="deliver", method="name", title=top["title"], query=text[:80], category=topic or "", sent=1)
+                await say(DONE); return True
             books = books[1:]                                       # found but no downloadable PDF: offer the rest
-        alts = [b for b in books if b["pdf"]][:5] or books[:5]
+        alts = books[:5]
         if alts:
-            await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "pick", "cands": alts})
-            await say(_alt_text(alts, topic or "this topic", text)); _log(phone, ok=False, query=text[:80], alternatives=len(alts))
+            await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "pick", "cands": alts, "topic": topic or ""})
+            await say(_alt_text(alts, topic or "this topic", text)); _log(phone, ok=False, stage="alts", method="name", query=text[:80], category=topic or "", alternatives=len(alts))
             return False
         _refund(phone)
         await asyncio.to_thread(_save, phone, {"mode": MODE, "step": "ask"})
         await say("😕 I couldn't find that book or a similar topic. Try the topic words (e.g. *python*, *networking*, *operating systems*), "
                   "send another name, or send *0* and choose *Topic wise*.")
-        _log(phone, ok=False, query=text[:80])
+        _log(phone, ok=False, stage="none", method="name", query=text[:80])
         return False
     except Exception:
         _refund(phone)
