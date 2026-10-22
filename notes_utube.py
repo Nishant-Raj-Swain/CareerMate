@@ -884,35 +884,41 @@ async def handle(phone: str, text: str, say) -> bool:
         await say(f"⏳ You've reached today's limit of {MAX_PER_DAY} videos. Please try again tomorrow.")
         return True
     t0 = time.perf_counter()
+    ctx: dict = {}                                            # filled by _run (title, duration) for the admin analytics page
+    ms = lambda: int((time.perf_counter() - t0) * 1000)
     try:
-        await _run(phone, vid, say)
-        _log(phone, video=vid, ms=int((time.perf_counter() - t0) * 1000))
+        await _run(phone, vid, say, ctx)
+        _log(phone, video=vid, ms=ms(), **ctx)
     except NotesError as e:
         _refund(phone)
-        _log(phone, ok=False, video=vid, message=str(e)[:200])
+        _log(phone, ok=False, video=vid, ms=ms(), message=str(e)[:200], **ctx)
         await say("❌ " + str(e))
     except Exception as e:
         _refund(phone)
         log.exception("notes_utube failed for %s", vid)
-        _log(phone, ok=False, video=vid, message=str(e)[:200])
+        _log(phone, ok=False, video=vid, ms=ms(), message=str(e)[:200], **ctx)
         await say("⚠️ Something went wrong while making the notes. Please try again in a few minutes.")
     await asyncio.to_thread(db.save_state, phone, {})
     return True
 
 
-async def _run(phone: str, vid: str, say) -> None:
+async def _run(phone: str, vid: str, say, ctx: dict | None = None) -> None:
+    ctx = ctx if ctx is not None else {}
     cached = _CACHE.get(vid)
     if cached and time.time() - cached[0] < CACHE_SECONDS:
         meta, notes, info = cached[1]["meta"], cached[1]["notes"], cached[1]["info"]
+        ctx.update(title=meta.get("title", "")[:150], channel=meta.get("channel", "")[:80], duration=int(info.get("duration") or 0), cached=True)
         await say("⚡ I already made notes for this video - sending them now.")
     else:
         await say("⏳ Got it! Fetching the video transcript...")
         meta = await asyncio.to_thread(fetch_meta, vid)
+        ctx.update(title=meta.get("title", "")[:150], channel=meta.get("channel", "")[:80])
         info, notes = {}, None
         try:
             mode = translate_mode()
             tr = await asyncio.to_thread(fetch_transcript, vid, mode == "youtube")
             info = {"lang": tr["lang"], "lang_name": tr["lang_name"], "duration": tr["duration"], "generated": tr["generated"]}
+            ctx["duration"] = int(tr["duration"] or 0)
             if tr["duration"] > MAX_MINUTES * 60:
                 raise NotesError(f"That video is {fmt_ts(tr['duration'])} long. I can handle videos up to {MAX_MINUTES // 60}h{MAX_MINUTES % 60:02d}m.")
             windows = build_windows(tr["snippets"])
