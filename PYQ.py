@@ -1,4 +1,26 @@
+"""pyqonline_scraper.py — Previous Year Question papers skill module.
 
+Drop-in module for the CareerMate WhatsApp bot (same interface as books.py):
+
+    MODE = "pyq"
+    is_active(state) -> bool
+    async start(phone, arg, say) -> bool       # entry from /pyq [subject]
+    async handle(phone, text, say) -> bool     # continuation while in this mode
+
+State machine (mirrors books.py topic-browse flow):
+    step=menu      1 = browse by university, 2 = quick search by subject
+    step=uni       pick university (paginated 10/page)
+    step=course    pick course (B.Tech / BCA / MCA ...)
+    step=branch    pick branch (CSE / IT / EEE ...) — auto-skipped if none
+    step=filter    ask user for semester + year (one message)
+    step=papers    paginated list of matched papers; reply number / all / next / back
+    step=deliver   download chosen PDF(s) and send via WhatsApp
+
+The module also runs standalone (CLI / Colab):
+
+    python pyqonline_scraper.py                # interactive prompts
+    python pyqonline_scraper.py probe "BPUT"   # debug a university
+"""
 from __future__ import annotations
 
 import asyncio
@@ -156,13 +178,21 @@ async def _fetch_university_list(client: httpx.AsyncClient) -> list[dict]:
     That array IS the left sidebar. Parse it once a day and cache."""
     if _UNI_CACHE["items"] and time.time() - _UNI_CACHE["at"] < _UNI_TTL:
         return _UNI_CACHE["items"]
-    r = await client.get(HUB_URL, timeout=TIMEOUT)
-    r.raise_for_status()
+    try:
+        r = await client.get(HUB_URL, timeout=TIMEOUT)
+    except Exception as e:
+        log.error("pyq: cannot reach %s: %r", HUB_URL, e)
+        raise PyqError(f"cannot reach source site: {e!r}")
+    if r.status_code != 200:
+        log.error("pyq: %s answered HTTP %s, body starts: %r", HUB_URL, r.status_code, r.text[:200])
+        raise PyqError(f"source site answered HTTP {r.status_code}")
     pattern = re.compile(
         r'\{\s*url:\s*"([^"]+)"\s*,\s*description:\s*"([^"]+)"\s*\}',
         re.IGNORECASE,
     )
     items = [{"url": u, "description": d} for u, d in pattern.findall(r.text)]
+    if not items:
+        log.error("pyq: no university list found in the page (layout changed or blocked); body starts: %r", r.text[:200])
     items = [it for it in items
              if any(k in it["description"].upper()
                     for k in ("UNIVERSITY", "INSTITUTE", "COLLEGE", "VIDYAPEETH"))]
