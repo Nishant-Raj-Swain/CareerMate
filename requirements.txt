@@ -17,6 +17,7 @@ youtube-transcript-api
 reportlab
 pillow
 requests
+scikit-learn
 
 # Admin Dashboard & Analytics
 streamlit
