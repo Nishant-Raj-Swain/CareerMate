@@ -491,37 +491,66 @@ async def _indiabix_search_companies(client: httpx.AsyncClient,
 
 async def _indiabix_list_company_papers(client: httpx.AsyncClient,
                                          slug: str) -> list[dict]:
-    """Fetch the first page of papers for a company. Returns:
-    [{title, posted_by, url, hearts}, ...]
-    The source site paginates with /page-N; we only fetch page 1 to keep the bot
-    responsive (typically 10 papers per page)."""
-    r = await client.get(f"{INDIABIX_BASE}/placement-papers/{slug}/",
-                         timeout=TIMEOUT)
-    if r.status_code == 404:
-        return []
-    r.raise_for_status()
-    papers = []
-    # Pattern: <div class="paper-list row"> <div class="col-12 paper-head">
-    #   <a href="https://www.indiabix.com/placement-papers/<slug>/<id>">Title</a>
-    #   </div> <div class="col-12 paper-details"> ...
-    #   <div class="postedby-name">Name</div> ... <div class="postedby-name">(N)</div>
-    # </div>
-    blocks = re.findall(
-        r'<div class="paper-list row">\s*'
-        r'<div class="col-12 paper-head"><a href="([^"]+)">([^<]+)</a></div>\s*'
-        r'<div class="col-12 paper-details">.*?'
-        r'<div class="postedby-name">([^<]+)</div>.*?</div>\s*</div>',
-        r.text, re.DOTALL
-    )
-    for url, title, posted_by in blocks:
-        title = title.strip()
-        posted_by = posted_by.strip()
-        papers.append({
-            "title": title,
-            "posted_by": posted_by,
-            "url": url,
-        })
-    return papers
+    """Fetch ALL papers for a company across ALL pages.
+    Returns: [{title, posted_by, url}, ...]
+
+    The source site paginates: /placement-papers/<slug>/ (page 1),
+    /placement-papers/<slug>/page-2, /placement-papers/<slug>/page-3, ...
+    The first page contains a "Page 1 of N" marker that tells us the total.
+    We iterate through all N pages and combine all papers."""
+    all_papers: list[dict] = []
+    page_num = 1
+    total_pages = 1  # default; updated after first page is fetched
+
+    while page_num <= total_pages:
+        # Build URL: page 1 = /placement-papers/<slug>/,
+        # page 2+ = /placement-papers/<slug>/page-<N>
+        if page_num == 1:
+            url = f"{INDIABIX_BASE}/placement-papers/{slug}/"
+        else:
+            url = f"{INDIABIX_BASE}/placement-papers/{slug}/page-{page_num}"
+
+        try:
+            r = await client.get(url, timeout=TIMEOUT)
+            if r.status_code == 404:
+                break
+            r.raise_for_status()
+        except Exception as e:
+            log.warning("pyq company papers page %d failed: %s", page_num, e)
+            break
+
+        html = r.text
+
+        # Detect total pages from "Page 1 of N" marker (only on first page)
+        if page_num == 1:
+            pag_m = re.search(r'Page\s+\d+\s+of\s+(\d+)', html, re.IGNORECASE)
+            if pag_m:
+                total_pages = int(pag_m.group(1))
+                log.info("pyq: company %s has %d page(s) of papers", slug, total_pages)
+
+        # Extract paper blocks from this page
+        blocks = re.findall(
+            r'<div class="paper-list row">\s*'
+            r'<div class="col-12 paper-head"><a href="([^"]+)">([^<]+)</a></div>\s*'
+            r'<div class="col-12 paper-details">.*?'
+            r'<div class="postedby-name">([^<]+)</div>.*?</div>\s*</div>',
+            html, re.DOTALL
+        )
+        if not blocks:
+            break  # no more papers
+
+        for paper_url, title, posted_by in blocks:
+            all_papers.append({
+                "title": title.strip(),
+                "posted_by": posted_by.strip(),
+                "url": paper_url,
+            })
+
+        page_num += 1
+        if page_num <= total_pages:
+            await asyncio.sleep(0.3)  # be polite
+
+    return all_papers
 
 
 async def _indiabix_fetch_paper_content(client: httpx.AsyncClient,
@@ -908,10 +937,8 @@ def _draw_logo_footer(canvas, doc, font, left_text: str = "") -> None:
 
 
 def _extract_questions_from_content(content: str) -> list[str]:
-    """Extract only questions from paper content.
-    Finds sentences ending with '?' (question mark) and also sentences that
-    start with common question words (What, Why, How, When, Where, Who, Which,
-    Do, Are, Can, Could, Would, Should, Is, Explain, Define, Describe, Tell).
+    """Extract only sentences that contain a '?' (question mark) from paper content.
+    Papers with random text (no '?') will return an empty list and be skipped.
     Returns a list of cleaned question strings."""
     import re as _re
     if not content:
@@ -921,13 +948,12 @@ def _extract_questions_from_content(content: str) -> list[str]:
     # Split into sentences by . ? or ! followed by space or end
     sentences = _re.split(r'(?<=[.!?])\s+', text)
     questions = []
-    question_starters = _re.compile(
-        r'^(?:what|why|how|when|where|who|which|do|are|can|could|would|should|is|'
-        r'explain|define|describe|tell|difference|write|draw|name|list|state)\b',
-        _re.IGNORECASE)
     for s in sentences:
         s = s.strip()
         if not s or len(s) < 10:
+            continue
+        # ONLY keep sentences that contain a '?'
+        if '?' not in s:
             continue
         # Strip leading conversational filler ("Then he asked", "Next she said", etc.)
         s = _re.sub(
@@ -937,20 +963,13 @@ def _extract_questions_from_content(content: str) -> list[str]:
             '', s, flags=_re.IGNORECASE)
         s = _re.sub(r'^(?:asked|said|told)\s+:?\s*', '', s, flags=_re.IGNORECASE)
         s = s.strip()
-        if not s:
+        if not s or '?' not in s:
             continue
-        # Keep if ends with '?' OR starts with a question word
-        ends_with_q = s.endswith('?')
-        starts_with_q_word = bool(question_starters.match(s))
-        if ends_with_q or starts_with_q_word:
-            # Capitalize first letter
-            s = s[0].upper() + s[1:] if s else s
-            # Ensure it ends with '?'
-            if not s.endswith('?'):
-                s = s.rstrip('.') + '?'
-            # Avoid duplicates
-            if s.lower() not in [q.lower() for q in questions]:
-                questions.append(s)
+        # Capitalize first letter
+        s = s[0].upper() + s[1:] if s else s
+        # Avoid duplicates
+        if s.lower() not in [q.lower() for q in questions]:
+            questions.append(s)
     return questions
 
 
@@ -1065,12 +1084,16 @@ def _indiabix_company_papers_to_pdf(company_name: str,
                                     leftIndent=12, spaceAfter=4,
                                     textColor=colors.grey, alignment=TA_LEFT),
     }
-    # Extract questions from each paper
+    # Extract questions from each paper (or use pre-extracted questions)
     total_questions = 0
     paper_questions = []
     for p in papers:
-        content = p.get("content", "")
-        qs = _extract_questions_from_content(content)
+        # If questions were already extracted (by _company_fetch_and_show),
+        # use them; otherwise extract now.
+        qs = p.get("questions")
+        if qs is None:
+            content = p.get("content", "")
+            qs = _extract_questions_from_content(content)
         paper_questions.append(qs)
         total_questions += len(qs)
 
@@ -1555,8 +1578,11 @@ def _parse_paper_selection(text: str, total: int) -> list[int] | None:
 #  Helpers for Section 2 (company search) and 3 (interview fetch + PDF)
 # =====================================================================
 async def _company_fetch_and_show(phone: str, say, company_query: str) -> bool:
-    """Search for the company, fetch the paper list, save state,
-    and show the paginated list. Returns True on success."""
+    """Search for the company, fetch ALL papers, extract questions from each,
+    build ONE PDF organized by section (paper title), and send via WhatsApp.
+
+    Papers that contain NO questions (random text only) are silently skipped.
+    The user never sees a paper picker — the bot does everything automatically."""
     await say(f"🔎 Searching for *{company_query}* ...")
     async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS) as client:
         matches = await _indiabix_search_companies(client, company_query)
@@ -1567,10 +1593,8 @@ async def _company_fetch_and_show(phone: str, say, company_query: str) -> bool:
     if len(matches) == 1:
         company_name, slug = matches[0]
     else:
-        # Multiple matches — pick the best one (shortest name = most specific)
-        # or ask user to disambiguate
+        # Multiple matches — ask user to disambiguate
         if len(matches) <= 5:
-            # Save matches and ask user
             await asyncio.to_thread(_save, phone, {
                 "mode": MODE, "step": "company_pick",
                 "matches": matches,
@@ -1584,21 +1608,92 @@ async def _company_fetch_and_show(phone: str, say, company_query: str) -> bool:
         # More than 5 — pick the first
         company_name, slug = matches[0]
 
-    await say(f"🔎 Fetching papers for *{company_name}* ...")
+    await say(f"🔎 Fetching ALL papers for *{company_name}* ...")
     async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS) as client:
         papers = await _indiabix_list_company_papers(client, slug)
     if not papers:
         await say(f"😕 No papers found for *{company_name}*. "
                   f"Try another company, or *back* / *exit*.")
         return False
+
+    # ---- Filter papers: keep only those with question-related keywords in title,
+    #      AND exclude any paper whose title contains "experience" (those are
+    #      personal interview stories, not question banks). ----
+    # Keywords: questions, aptitude, reasoning, technical, hr, gd, written,
+    # verbal, quantitative, logical, coding, online test, assessment, etc.
+    keyword_re = re.compile(
+        r'\b(question|aptitude|reasoning|technical|hr|gd|'
+        r'written|verbal|quantitative|logical|coding|online\s*test|'
+        r'assessment|placement\s*paper|test\s*pattern)\b',
+        re.IGNORECASE)
+    experience_re = re.compile(r'\bexperience\b', re.IGNORECASE)
+    # Priority: has keyword AND does NOT have "experience"
+    priority_papers = [p for p in papers
+                       if keyword_re.search(p.get("title", ""))
+                       and not experience_re.search(p.get("title", ""))]
+    # Other: no keyword (fallback — processed after priority)
+    other_papers = [p for p in papers
+                    if not keyword_re.search(p.get("title", ""))]
+    # Process priority papers first, then others as fallback
+    sorted_papers = priority_papers + other_papers
+
+    await say(f"📊 Found *{len(papers)}* paper(s) total. "
+              f"Processing *{len(priority_papers)}* question/aptitude/reasoning paper(s) "
+              f"(excluding 'Experience' stories) ..."
+              + (f" + {len(other_papers)} other(s) as fallback." if other_papers else ""))
+
+    # Fetch content for each paper + extract questions.
+    # Only keep papers that actually HAVE questions.
+    papers_with_questions: list[dict] = []
+    total_questions = 0
+    async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS) as client:
+        for i, p in enumerate(sorted_papers, 1):
+            await say(f"⏳ [{i}/{len(sorted_papers)}] {p['title'][:50]} ...")
+            try:
+                content = await _indiabix_fetch_paper_content(client, p["url"])
+            except Exception as e:
+                log.warning("paper fetch failed: %s", e)
+                content = ""
+            # Extract only sentences with "?"
+            qs = _extract_questions_from_content(content)
+            if qs:
+                p["content"] = content
+                p["questions"] = qs
+                papers_with_questions.append(p)
+                total_questions += len(qs)
+            await asyncio.sleep(0.2)  # be polite
+
+    if not papers_with_questions:
+        await say(f"😕 No questions found in any of the {len(papers)} papers for "
+                  f"*{company_name}*. Try another company, or *back* / *exit*.")
+        return False
+
+    await say(f"✅ Extracted *{total_questions}* question(s) from "
+              f"*{len(papers_with_questions)}* paper(s). Generating PDF ...")
+
+    # Build ONE PDF with all sections
+    pdf_bytes = await asyncio.to_thread(
+        _indiabix_company_papers_to_pdf, company_name, papers_with_questions)
+    if not pdf_bytes or pdf_bytes[:4] != b"%PDF":
+        await say("⚠️ PDF generation failed. Please try another company, or *back* / *exit*.")
+        return False
+    if len(pdf_bytes) > MAX_MB * 1024 * 1024:
+        await say(f"📎 The PDF is too large for WhatsApp ({len(pdf_bytes)//1024} KB). "
+                  f"Try a smaller company, or *back*.")
+        return False
+    size_kb = len(pdf_bytes) / 1024
+    caption = (f"📝 {company_name} - Interview Questions\n"
+               f"📊 {total_questions} question(s) from {len(papers_with_questions)} paper(s)\n"
+               f"📦 Size: {size_kb:.0f} KB")
+    await _send_file(phone, f"{company_name}_questions", pdf_bytes,
+                      "https://www.indiabix.com/placement-papers/", say, caption)
+    await say(f"✅ Sent *{company_name}* ({total_questions} questions from "
+              f"{len(papers_with_questions)} papers). "
+              f"Send *back* for another company, or */pyq* for the menu.")
+    # Save state so user can search another company
     await asyncio.to_thread(_save, phone, {
-        "mode": MODE, "step": "company_papers",
-        "company_name": company_name,
-        "company_slug": slug,
-        "papers": papers,
-        "page": 0,
+        "mode": MODE, "step": "company_search",
     })
-    await _show_company_papers_list(phone, say, company_name, papers, page=0)
     return True
 
 
