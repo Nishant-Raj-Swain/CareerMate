@@ -1631,24 +1631,24 @@ async def _company_fetch_and_show(phone: str, say, company_query: str) -> bool:
     priority_papers = [p for p in papers
                        if keyword_re.search(p.get("title", ""))
                        and not experience_re.search(p.get("title", ""))]
-    # Other: no keyword (fallback — processed after priority)
-    other_papers = [p for p in papers
-                    if not keyword_re.search(p.get("title", ""))]
-    # Process priority papers first, then others as fallback
-    sorted_papers = priority_papers + other_papers
+    # Only process top 20 priority papers (no fallback to others)
+    top_papers = priority_papers[:20]
 
-    await say(f"📊 Found *{len(papers)}* paper(s) total. "
-              f"Processing *{len(priority_papers)}* question/aptitude/reasoning paper(s) "
-              f"(excluding 'Experience' stories) ..."
-              + (f" + {len(other_papers)} other(s) as fallback." if other_papers else ""))
+    if not top_papers:
+        await say(f"😕 No question/aptitude/reasoning papers found for "
+                  f"*{company_name}* (all were 'Experience' stories). "
+                  f"Try another company, or *back* / *exit*.")
+        return False
+
+    await say(f"📊 Fetching top {len(top_papers)} placement paper(s) for "
+              f"*{company_name}*. Building PDF... (this may take a minute)")
 
     # Fetch content for each paper + extract questions.
     # Only keep papers that actually HAVE questions.
     papers_with_questions: list[dict] = []
     total_questions = 0
     async with httpx.AsyncClient(follow_redirects=True, headers=HEADERS) as client:
-        for i, p in enumerate(sorted_papers, 1):
-            await say(f"⏳ [{i}/{len(sorted_papers)}] {p['title'][:50]} ...")
+        for p in top_papers:
             try:
                 content = await _indiabix_fetch_paper_content(client, p["url"])
             except Exception as e:
