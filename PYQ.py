@@ -826,6 +826,134 @@ def _extract_qas_from_html(html: str) -> list[dict]:
 # =====================================================================
 #  PDF GENERATION  (reportlab)  — shared by all 3 interview sections
 # =====================================================================
+
+# Path to the CareerMate logo (used as a footer watermark on every page)
+LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "careermate_logo.png")
+
+
+def _draw_logo_footer(canvas, doc, font, left_text: str = "") -> None:
+    """Draw page number (center), left text, CareerMate logo (bottom-right),
+    and a "Start chatting" hyperlink next to the logo on every page of the PDF.
+
+    Layout (bottom of page, left to right):
+      [left_text]          [page #]              [logo] [Start chatting →]
+                                                    ↑ clickable link to wa.me/919938467858
+    """
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.units import mm
+    from reportlab.lib import colors
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    canvas.saveState()
+    canvas.setFont(font, 8)
+    canvas.setFillColor(colors.grey)
+    # Page number (center)
+    canvas.drawCentredString(A4[0] / 2, 10 * mm, str(doc.page))
+    # Left text
+    if left_text:
+        canvas.drawString(15 * mm, 10 * mm, left_text[:60])
+
+    # ---- Logo + "Start chatting" hyperlink (bottom-right) ----
+    chat_url = "https://wa.me/919938467858?text=Hello%21+I+am+interested+in+learning+more+about+your+business"
+    chat_label = "Start chatting"
+    # Measure the text width so we can place the link rectangle precisely
+    canvas.setFont(font, 8)
+    label_w = stringWidth(chat_label, font, 8)
+
+    logo_w = 30 * mm
+    logo_h = logo_w * (52.0 / 191.0)
+    logo_x = A4[0] - 15 * mm - logo_w
+    logo_y = 7 * mm
+
+    # "Start chatting" text goes to the LEFT of the logo
+    link_text_x = logo_x - 5 * mm - label_w
+    link_text_y = 10 * mm
+
+    # Draw "Start chatting" in blue (link color)
+    canvas.setFillColor(colors.HexColor("#1a73e8"))
+    canvas.setFont(font, 8)
+    canvas.drawString(link_text_x, link_text_y, chat_label)
+
+    # Draw an underline beneath the link text
+    canvas.setLineWidth(0.5)
+    canvas.setStrokeColor(colors.HexColor("#1a73e8"))
+    canvas.line(link_text_x, link_text_y - 1, link_text_x + label_w, link_text_y - 1)
+
+    # Make the text clickable (invisible rectangle over the text)
+    canvas.linkURL(
+        chat_url,
+        (link_text_x, link_text_y - 2,
+         link_text_x + label_w, link_text_y + 10),
+        relative=0,
+        thickness=0,  # no border (we drew our own underline)
+    )
+
+    # Draw the logo image
+    if os.path.exists(LOGO_PATH):
+        try:
+            from reportlab.lib.utils import ImageReader
+            img = ImageReader(LOGO_PATH)
+            canvas.drawImage(img, logo_x, logo_y,
+                             width=logo_w, height=logo_h, mask='auto')
+            # Make the logo itself clickable too
+            canvas.linkURL(
+                chat_url,
+                (logo_x, logo_y, logo_x + logo_w, logo_y + logo_h),
+                relative=0,
+                thickness=0,
+            )
+        except Exception:
+            pass
+    canvas.restoreState()
+
+
+def _extract_questions_from_content(content: str) -> list[str]:
+    """Extract only questions from paper content.
+    Finds sentences ending with '?' (question mark) and also sentences that
+    start with common question words (What, Why, How, When, Where, Who, Which,
+    Do, Are, Can, Could, Would, Should, Is, Explain, Define, Describe, Tell).
+    Returns a list of cleaned question strings."""
+    import re as _re
+    if not content:
+        return []
+    # Join newlines into spaces so questions spanning lines are captured
+    text = content.replace('\n', ' ')
+    # Split into sentences by . ? or ! followed by space or end
+    sentences = _re.split(r'(?<=[.!?])\s+', text)
+    questions = []
+    question_starters = _re.compile(
+        r'^(?:what|why|how|when|where|who|which|do|are|can|could|would|should|is|'
+        r'explain|define|describe|tell|difference|write|draw|name|list|state)\b',
+        _re.IGNORECASE)
+    for s in sentences:
+        s = s.strip()
+        if not s or len(s) < 10:
+            continue
+        # Strip leading conversational filler ("Then he asked", "Next she said", etc.)
+        s = _re.sub(
+            r'^(?:then|next|after\s+that|also|she|he|they|hr|mr|tr|sir|madam|'
+            r'the\s+interviewer|the\s+panel)\s+(?:asked|said|told|wanted\s+to\s+know|'
+            r'questioned|inquired)\s*:?\s*',
+            '', s, flags=_re.IGNORECASE)
+        s = _re.sub(r'^(?:asked|said|told)\s+:?\s*', '', s, flags=_re.IGNORECASE)
+        s = s.strip()
+        if not s:
+            continue
+        # Keep if ends with '?' OR starts with a question word
+        ends_with_q = s.endswith('?')
+        starts_with_q_word = bool(question_starters.match(s))
+        if ends_with_q or starts_with_q_word:
+            # Capitalize first letter
+            s = s[0].upper() + s[1:] if s else s
+            # Ensure it ends with '?'
+            if not s.endswith('?'):
+                s = s.rstrip('.') + '?'
+            # Avoid duplicates
+            if s.lower() not in [q.lower() for q in questions]:
+                questions.append(s)
+    return questions
+
+
 def _pdf_setup_fonts():
     """Pick fonts. Returns (body_font, bold_font, mono_font).
     Uses DejaVu if available (handles unicode + em-dashes + code symbols)."""
@@ -897,17 +1025,25 @@ def _md_to_xml(text: str, mono_font: str) -> str:
 
 def _indiabix_company_papers_to_pdf(company_name: str,
                                       papers: list[dict]) -> bytes | None:
-    """Build a PDF bundling multiple company placement papers.
-    Each paper = {title, posted_by, url, content}."""
+    """Build a PDF with interview QUESTIONS extracted from company placement papers.
+    Each paper's content is parsed for questions (sentences ending with '?' or
+    starting with question words). The PDF shows:
+      [Title page]
+      Section 1: <paper title>
+        Q1: <question>
+        Q2: <question>
+      Section 2: <paper title>
+        Q1: <question>
+    The CareerMate logo is drawn in the footer of every page."""
     import io
     try:
-        from reportlab.lib.enums import TA_JUSTIFY, TA_CENTER
+        from reportlab.lib.enums import TA_JUSTIFY, TA_CENTER, TA_LEFT
         from reportlab.lib.pagesizes import A4
         from reportlab.lib.styles import ParagraphStyle
         from reportlab.lib.units import mm
         from reportlab.lib import colors
         from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer,
-                                        PageBreak, HRFlowable, Preformatted)
+                                        PageBreak, HRFlowable)
     except ImportError:
         log.warning("reportlab not installed: cannot build company PDF")
         return None
@@ -917,51 +1053,64 @@ def _indiabix_company_papers_to_pdf(company_name: str,
                                     alignment=TA_CENTER, spaceAfter=10),
         "subtitle":  ParagraphStyle("st", fontName=font, fontSize=13, leading=18,
                                     alignment=TA_CENTER, spaceAfter=6),
-        "meta":      ParagraphStyle("m", fontName=font, fontSize=10, leading=14,
-                                    alignment=TA_CENTER, textColor=colors.grey),
-        "paper_h":   ParagraphStyle("ph", fontName=bold, fontSize=14, leading=20,
+        "section_h": ParagraphStyle("sh", fontName=bold, fontSize=14, leading=20,
                                     spaceBefore=18, spaceAfter=4,
                                     textColor=colors.HexColor("#0b5394")),
-        "paper_sub": ParagraphStyle("ps", fontName=font, fontSize=9, leading=12,
-                                    spaceAfter=8, textColor=colors.grey),
-        "body":      ParagraphStyle("b", fontName=font, fontSize=10, leading=14,
-                                    alignment=TA_JUSTIFY, spaceAfter=6),
+        "section_sub": ParagraphStyle("ss", fontName=font, fontSize=9, leading=12,
+                                      spaceAfter=8, textColor=colors.grey),
+        "q_item":    ParagraphStyle("qi", fontName=font, fontSize=10, leading=14,
+                                    leftIndent=12, spaceAfter=4,
+                                    alignment=TA_LEFT),
+        "no_q":      ParagraphStyle("nq", fontName=font, fontSize=10, leading=14,
+                                    leftIndent=12, spaceAfter=4,
+                                    textColor=colors.grey, alignment=TA_LEFT),
     }
+    # Extract questions from each paper
+    total_questions = 0
+    paper_questions = []
+    for p in papers:
+        content = p.get("content", "")
+        qs = _extract_questions_from_content(content)
+        paper_questions.append(qs)
+        total_questions += len(qs)
+
     story = [Spacer(1, 50 * mm)]
     story.append(Paragraph(_md_to_xml(company_name, mono), st["title"]))
-    story.append(Paragraph(f"Placement Papers — {len(papers)} paper(s)", st["subtitle"]))
+    story.append(Paragraph(
+        f"Interview Questions — {total_questions} question(s) from {len(papers)} paper(s)",
+        st["subtitle"]))
     story.append(Spacer(1, 6 * mm))
     story.append(PageBreak())
-    for i, p in enumerate(papers, 1):
-        story.append(Paragraph(f"{i}. {_md_to_xml(p.get('title', ''), mono)}",
-                                st["paper_h"]))
-        sub = f"Posted by: {p.get('posted_by', '—')}"
-        story.append(Paragraph(_md_to_xml(sub, mono), st["paper_sub"]))
+
+    for i, (p, qs) in enumerate(zip(papers, paper_questions), 1):
+        # Section heading = paper title
+        story.append(Paragraph(
+            f"Section {i}: {_md_to_xml(p.get('title', ''), mono)}",
+            st["section_h"]))
+        sub = f"Posted by: {p.get('posted_by', '—')}  |  {len(qs)} question(s)"
+        story.append(Paragraph(_md_to_xml(sub, mono), st["section_sub"]))
         story.append(HRFlowable(width="100%", thickness=0.3,
                                 color=colors.HexColor("#cccccc")))
         story.append(Spacer(1, 3 * mm))
-        content = p.get("content", "")
-        # Split content into paragraphs
-        for para in content.split("\n\n"):
-            para = para.strip()
-            if not para:
-                continue
-            # Long paragraphs may need to be split further
-            story.append(Paragraph(_md_to_xml(para, mono), st["body"]))
+        # List the questions
+        if qs:
+            for j, q in enumerate(qs, 1):
+                story.append(Paragraph(
+                    f"Q{j}. {_md_to_xml(q, mono)}", st["q_item"]))
+        else:
+            story.append(Paragraph(
+                "(No questions found in this paper.)", st["no_q"]))
         if i < len(papers):
-            story.append(PageBreak())
+            story.append(Spacer(1, 6 * mm))
+
+    left_text = f"{company_name} - Interview Questions"
     def _footer(canvas, doc):
-        canvas.saveState()
-        canvas.setFont(font, 8)
-        canvas.setFillColor(colors.grey)
-        canvas.drawCentredString(A4[0] / 2, 10 * mm, str(doc.page))
-        canvas.drawString(15 * mm, 10 * mm, f"{company_name} - Placement Papers")
-        canvas.restoreState()
+        _draw_logo_footer(canvas, doc, font, left_text=left_text)
     buf = io.BytesIO()
     SimpleDocTemplate(buf, pagesize=A4,
                       leftMargin=15 * mm, rightMargin=15 * mm,
                       topMargin=15 * mm, bottomMargin=18 * mm,
-                      title=f"{company_name} Placement Papers",
+                      title=f"{company_name} - Interview Questions",
                       author="").build(story,
                                                 onFirstPage=_footer,
                                                 onLaterPages=_footer)
@@ -1013,13 +1162,9 @@ def _indiabix_discussion_to_pdf(section_name: str, topic: str,
                 story.append(Paragraph(_md_to_xml(para, mono), st["body"]))
         if i < len(top_answers):
             story.append(Spacer(1, 6 * mm))
+    _left = f"{section_name} - {topic[:40]}"
     def _footer(canvas, doc):
-        canvas.saveState()
-        canvas.setFont(font, 8)
-        canvas.setFillColor(colors.grey)
-        canvas.drawCentredString(A4[0] / 2, 10 * mm, str(doc.page))
-        canvas.drawString(15 * mm, 10 * mm, f"{section_name} - {topic[:40]}")
-        canvas.restoreState()
+        _draw_logo_footer(canvas, doc, font, left_text=_left)
     buf = io.BytesIO()
     SimpleDocTemplate(buf, pagesize=A4,
                       leftMargin=15 * mm, rightMargin=15 * mm,
@@ -1117,13 +1262,9 @@ def _indiabix_tech_qas_to_pdf(topic_name: str, subtopic_name: str,
                     story.append(Preformatted(_md_to_xml(code, mono), st["code"]))
         if i < len(qas):
             story.append(Spacer(1, 4 * mm))
+    _left = f"{topic_name} - {subtopic_name}"[:50]
     def _footer(canvas, doc):
-        canvas.saveState()
-        canvas.setFont(font, 8)
-        canvas.setFillColor(colors.grey)
-        canvas.drawCentredString(A4[0] / 2, 10 * mm, str(doc.page))
-        canvas.drawString(15 * mm, 10 * mm, f"{topic_name} - {subtopic_name}"[:50])
-        canvas.restoreState()
+        _draw_logo_footer(canvas, doc, font, left_text=_left)
     buf = io.BytesIO()
     SimpleDocTemplate(buf, pagesize=A4,
                       leftMargin=15 * mm, rightMargin=15 * mm,
