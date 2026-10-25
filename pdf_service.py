@@ -45,7 +45,7 @@ def extract_text(filename: str, content: bytes) -> str:
     if not text.strip():
         try:
             mime_type = "application/pdf" if filename.endswith(".pdf") else "image/png"
-            for model in ("gemini-2.5-flash", "gemini-2.5-flash-lite"):         # second model is the fallback
+            for model in ("gemini-2.5-flash", "gemini-3.5-flash-lite"):         # second model is the fallback
                 try:
                     response = client.models.generate_content(
                         model=model,
