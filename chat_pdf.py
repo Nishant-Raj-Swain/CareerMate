@@ -35,7 +35,7 @@
 #
 # Low-AI-usage design (every step below avoids a paid / rate-limited call):
 #   * a PDF is hashed (SHA-256); the same file is never parsed or embedded twice (chunks + vectors are copied)
-#   * embeddings: LOCAL first (pip install fastembed; CHAT_PDF_EMBED_PROVIDERS=local,gemini,nvidia; "off" = BM25 only)
+#   * embeddings: API providers by default; LOCAL is opt-in (needs ~400MB+ RAM; CHAT_PDF_EMBED_PROVIDERS=local,gemini; "off" = BM25 only)
 #   * one batched embedding request per PDF at upload, none at question time except the question itself (cached)
 #   * follow-up questions are rewritten by a rule (no LLM call); exactly ONE LLM call per answer
 #   * identical question on the same PDF is answered from a cache (no calls at all)
@@ -287,7 +287,7 @@ def embed(texts: list[str], task: str, only_tag: str | None = None):
     """Returns (vectors, model_tag) or (None, None) if no provider works (then search is BM25-only).
     `only_tag` pins the provider (queries must use the doc's embedding model).
     CHAT_PDF_EMBED_PROVIDERS = comma list from local,gemini,jina,mistral,nvidia ('off' = never embed)."""
-    order = [x.strip() for x in (_env("CHAT_PDF_EMBED_PROVIDERS") or "local,gemini,jina,mistral,nvidia").lower().split(",") if x.strip()]
+    order = [x.strip() for x in (_env("CHAT_PDF_EMBED_PROVIDERS") or "gemini,jina,mistral,nvidia").lower().split(",") if x.strip()]
     if "off" in order:
         return None, None
     avail = {"local": (_local_available, _embed_local), "gemini": (lambda: bool(_gemini_key()), _embed_gemini),
@@ -1311,7 +1311,7 @@ def provider_status() -> dict:
                        ("mistral", lambda: bool(_env("MISTRAL_API_KEY"))), ("nvidia", lambda: bool(_nvidia_key()))):
         emb.append({"provider": n, "configured": bool(ok_fn())})
     return {"llm": llm_rows, "embed": emb,
-            "embed_order": (_env("CHAT_PDF_EMBED_PROVIDERS") or "local,gemini,jina,mistral,nvidia"), "llm_order": ",".join(order)}
+            "embed_order": (_env("CHAT_PDF_EMBED_PROVIDERS") or "gemini,jina,mistral,nvidia"), "llm_order": ",".join(order)}
 
 
 def test_providers() -> list[dict]:
@@ -1328,7 +1328,7 @@ def test_providers() -> list[dict]:
                        ("mistral", _embed_mistral, bool(_env("MISTRAL_API_KEY"))), ("nvidia", _embed_nvidia, bool(_nvidia_key()))):
         if has:
             jobs.append(("embed", n, n, fn))
-    if _local_available():
+    if _local_available() and "local" in (_env("CHAT_PDF_EMBED_PROVIDERS") or "").lower():   # opt-in only (RAM heavy)
         jobs.append(("embed", "local", "local", _embed_local))
 
     def run(j):
