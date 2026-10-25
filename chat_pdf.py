@@ -24,7 +24,7 @@
 #   OPENROUTER_API_KEY                   LLM fallback
 #   CHAT_PDF_NVIDIA_MODEL                default moonshotai/kimi-k2-instruct
 #   CHAT_PDF_OPENROUTER_MODEL            default google/gemini-2.0-flash-001
-#   CHAT_PDF_GEMINI_MODEL                default gemini-2.5-flash, then gemini-2.5-flash-lite (comma list; add gemini-3.x names here
+#   CHAT_PDF_GEMINI_MODEL                default gemini-2.5-flash, then gemini-3.5-flash-lite (comma list; add gemini-3.x names here
 #                                        if your key is refused for 2.5)
 #   CHAT_PDF_GEMINI_THINKING             thinking level for gemini-3*: minimal|low (default)|medium|high|off
 #   CHAT_PDF_GEMINI_EMBED_MODEL          default gemini-embedding-001
@@ -336,10 +336,25 @@ def _gemini_model() -> str:
     return _models_of("gemini", PROVIDERS["gemini"])[0]               # default gemini-2.5-flash
 
 
+_DEAD_MODELS: dict[str, float] = {}      # model -> until: retired / unknown models are not retried for 6 hours
+
+
+def mark_dead_model(model: str, err) -> bool:
+    """Call when a Gemini call fails. A 404 / 'no longer available' means the model name itself is the problem."""
+    e = str(err).lower()
+    if "404" in e or "no longer available" in e or "not found" in e:
+        _DEAD_MODELS[model] = time.time() + 6 * 3600
+        log.warning("Gemini model %s is unavailable for this key - skipping it for 6h: %s", model, str(err)[:120])
+        return True
+    return False
+
+
 def gemini_candidates() -> list[tuple[str, str]]:
     """[(model, key)] for things only Gemini can do (e.g. reading a YouTube video): every Gemini model x every key."""
     p = PROVIDERS["gemini"]
-    return [(m, k) for m in _models_of("gemini", p) for k in _keys_of(p)]
+    now = time.time()
+    models = [m for m in _models_of("gemini", p) if _DEAD_MODELS.get(m, 0) <= now] or _models_of("gemini", p)
+    return [(m, k) for m in models for k in _keys_of(p)]
 
 
 def _chat_gemini(messages: list[dict], max_tokens: int, model: str | None = None, key: str | None = None) -> str:
@@ -418,7 +433,7 @@ PROVIDERS: dict[str, dict] = {
                    "models": ["@cf/meta/llama-3.1-8b-instruct"]},
     "openrouter": {"keys": ("OPENROUTER_API_KEY",), "base": lambda: _openrouter_base(), "headers": {"X-Title": "CareerMate"},
                    "models": ["openai/gpt-oss-120b:free", "meta-llama/llama-3.3-70b-instruct:free", "google/gemini-2.0-flash-001"]},
-    "gemini": {"keys": ("GEMINI_API_KEY", "GOOGLE_API_KEY"), "gemini": True, "models": ["gemini-2.5-flash", "gemini-2.5-flash-lite"]},
+    "gemini": {"keys": ("GEMINI_API_KEY", "GOOGLE_API_KEY"), "gemini": True, "models": ["gemini-2.5-flash", "gemini-3.5-flash-lite"]},
 }
 DEFAULT_ORDER = "groq,cerebras,mistral,sambanova,nvidia,cloudflare,openrouter,gemini"
 _COOLDOWN: dict[str, float] = {}
@@ -512,6 +527,8 @@ def llm(messages: list[dict], max_tokens: int = ANSWER_TOKENS) -> str:
             errors.append(f"{name}/{model}: empty reply")
         except Exception as e:
             errors.append(f"{name}/{model}: {str(e)[:120]}")
+            if p.get("gemini"):
+                mark_dead_model(model, e)
             _track("llm", name, model, False, int((time.perf_counter() - t_try) * 1000), str(e))
             _cool(tag, str(e))
             log.warning("LLM %s/%s failed: %s", name, model, str(e)[:160])
