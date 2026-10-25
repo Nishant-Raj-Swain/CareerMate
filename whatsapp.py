@@ -1,6 +1,8 @@
+import asyncio
 import logging
 import os
 import re
+import time
 import httpx
 
 logger = logging.getLogger("career_bot")
@@ -8,8 +10,42 @@ logger = logging.getLogger("career_bot")
 
 class WhatsApp:
 
+    # Meta throttles bursts to one user ("pair rate limit", error 131056 / 130429). Messages sent too fast can be
+    # accepted by the API (HTTP 200) and still never reach the phone, so every outgoing message is paced.
+    MIN_GAP = float(os.getenv("WA_MIN_GAP_SECONDS", "1.2"))        # seconds between two messages to the same user
+    RATE_CODES = {130429, 131056, 131048, 80007, 4, 17, 613}
+
     def __init__(self):
         self.client = httpx.AsyncClient(timeout=15.0)
+        self._last = {}
+        self._locks = {}
+
+    async def _pace(self, phone):
+        key = re.sub(r"[^\d]", "", str(phone))
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            wait = self._last.get(key, 0.0) + self.MIN_GAP - time.monotonic()
+            if wait > 0:
+                await asyncio.sleep(wait)
+            self._last[key] = time.monotonic()
+
+    async def _send(self, payload: dict):
+        """POST /messages, paced per recipient; retries once (after 6 s) when Meta says we are sending too fast."""
+        await self._pace(payload.get("to", ""))
+        for attempt in (1, 2):
+            response = await self.client.post(f"{self.base_url}/messages", headers=self.headers, json=payload)
+            if response.status_code == 200:
+                return response
+            try:
+                code = int((response.json().get("error") or {}).get("code") or 0)
+            except Exception:
+                code = 0
+            if attempt == 1 and (response.status_code == 429 or code in self.RATE_CODES):
+                logger.warning("WhatsApp rate limit (code %s) for %s; retrying in 6 s", code, payload.get("to"))
+                await asyncio.sleep(6)
+                continue
+            return response
+        return response
 
     @property
     def phone_number_id(self) -> str:
@@ -81,9 +117,7 @@ class WhatsApp:
 
         logger.info(f"Sending WhatsApp message to {clean_phone}")
 
-        response = await self.client.post(
-            f"{self.base_url}/messages", headers=self.headers, json=payload
-        )
+        response = await self._send(payload)
 
         # PRINT/LOG THE EXACT OUTGOING META RESPONSE
         if response.status_code != 200:
@@ -164,9 +198,7 @@ class WhatsApp:
             "type": "document",
             "document": {"id": media_id, "filename": filename},
         }
-        response = await self.client.post(
-            f"{self.base_url}/messages", headers=self.headers, json=payload
-        )
+        response = await self._send(payload)
         return response
 
     async def send_roadmap_pdf(self, to: str, topic_name: str) -> bool:
@@ -233,9 +265,7 @@ class WhatsApp:
             "type": "image",
             "image": {"id": media_id, "caption": caption},
         }
-        await self.client.post(
-            f"{self.base_url}/messages", headers=self.headers, json=payload
-        )
+        await self._send(payload)
 
     async def close(self):
         await self.client.aclose()
