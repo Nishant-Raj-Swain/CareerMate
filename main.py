@@ -42,6 +42,7 @@ APP_SECRET = os.getenv("META_APP_SECRET", "").strip()
 import database as db
 import pdf_service
 import chat_pdf  # NEW: /chat_pdf (RAG over a PDF the user sends)
+import job_control  # NEW: "/cancel" stops a running job immediately
 import books  # NEW: /books (topic wise / book name -> PDF from freebookcentre.net + freecomputerbooks.com)
 import notes_utube  # NEW: /utube_notes (YouTube link -> point-wise notes + PDF)
 import quiz  # NEW: /practice (category -> topic -> 20 random MCQs), same job as quiz_service
@@ -123,13 +124,70 @@ async def lifespan(app: FastAPI):
     checkpointer = MemorySaver()
     langgraph_app = build_agent(checkpointer)
 
+    janitor = asyncio.create_task(_quiz_janitor())       # closes quizzes users stopped answering
     yield
+    janitor.cancel()
 
     await wa.close()
 
 app = FastAPI(title="WhatsApp Career Assistant", lifespan=lifespan)
 
 app.include_router(admin_router)
+
+
+JOB_MAX_SECONDS = float(os.getenv("JOB_MAX_SECONDS", "600"))      # no single request may hold a user's lock longer
+QUIZ_IDLE_MIN = float(os.getenv("QUIZ_IDLE_MINUTES", "30"))     # a quiz with no answer for this long counts as "left"
+
+
+def _quiz_meta(state: dict) -> dict:
+    qs = state.get("questions") or []
+    started = state.get("started_at")
+    return {"topic": state.get("topic", "quiz"), "score": state.get("score", 0), "attempted": state.get("current_index", 0),
+            "total": len(qs), "duration_s": int(time.time() - started) if started else None}
+
+
+def abandon_quiz(phone: str, state: dict | None, reason: str) -> bool:
+    """If the user is in the middle of a quiz, stores what they scored so far (analytics_events 'quiz_exit_early' +
+    a quiz_analytics row with completed=false) so the admin panel shows 'Left' with a score instead of
+    'In Progress' forever. Returns True if a quiz was closed. The caller clears / replaces the state."""
+    try:
+        if not state or state.get("mode") != "quiz" or not state.get("questions"):
+            return False
+        meta = _quiz_meta(state)
+        analytics.log_event(phone, "quiz_exit_early", command="/quiz", meta={**meta, "reason": reason})
+        analytics.record_quiz(phone, meta["topic"], meta["score"], meta["attempted"], completed=False)
+        return True
+    except Exception:
+        logger.exception("abandon_quiz failed")
+        return False
+
+
+def close_idle_quizzes() -> int:
+    """Quizzes nobody finished (user just stopped answering): save the score so far and free the user."""
+    n = 0
+    try:
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT phone FROM users WHERE state::text LIKE %s", ('%"mode": "quiz"%',))
+                phones = [r["phone"] for r in cur.fetchall()]
+        for ph in phones:
+            st = db.get_user(ph).get("state") or {}
+            last = st.get("updated_at") or st.get("started_at") or 0
+            if st.get("mode") == "quiz" and time.time() - last > QUIZ_IDLE_MIN * 60:
+                if abandon_quiz(ph, st, "timeout"):
+                    n += 1
+                db.save_state(ph, {})
+    except Exception:
+        logger.exception("close_idle_quizzes failed")
+    return n
+
+
+async def _quiz_janitor():
+    while True:
+        await asyncio.sleep(300)
+        closed = await asyncio.to_thread(close_idle_quizzes)
+        if closed:
+            logger.info("Closed %d idle quiz(zes)", closed)
 
 
 async def send_next_question(phone: str, state: dict):
@@ -145,8 +203,10 @@ async def send_next_question(phone: str, state: dict):
         # NEW: quiz completion event for the admin dashboard's quiz analytics
         analytics.log_event(
             phone, "quiz_complete",
-            meta={"topic": state.get("topic", "quiz"), "score": score, "total": total}
+            meta={"topic": state.get("topic", "quiz"), "score": score, "total": total,
+                  "duration_s": int(time.time() - state["started_at"]) if state.get("started_at") else None}
         )
+        analytics.record_quiz(phone, state.get("topic", "quiz"), score, total, completed=True)
 
         await wa.text(
             phone,
@@ -211,7 +271,8 @@ async def _practice_output(phone: str, msgs, questions, topic):
             await wa.menu(phone)
         return
     analytics.log_event(phone, "quiz_start", meta={"topic": topic, "count": len(questions), "source": "practice"})
-    quiz_state = {"mode": "quiz", "topic": topic, "questions": questions, "current_index": 0, "score": 0}
+    quiz_state = {"mode": "quiz", "topic": topic, "questions": questions, "current_index": 0, "score": 0,
+                  "started_at": time.time(), "updated_at": time.time()}
     db.save_state(phone, quiz_state)
     await send_next_question(phone, quiz_state)
 
@@ -266,10 +327,7 @@ async def handle_text(phone: str, text: str):
             attempted = state.get("current_index", 0)
             topic = state.get("topic", "Quiz").title()
 
-            analytics.log_event(
-                phone, "quiz_exit_early",
-                meta={"topic": state.get("topic", "quiz"), "score": score, "attempted": attempted}
-            )
+            abandon_quiz(phone, state, "exit")
 
             await wa.text(
                 phone,
@@ -307,6 +365,7 @@ async def handle_text(phone: str, text: str):
                 await wa.text(phone, f"❌ *Incorrect.* Correct Answer: *{correct_label}*{tip}")
 
         state["current_index"] = idx + 1
+        state["updated_at"] = time.time()
         db.save_state(phone, state)
         await send_next_question(phone, state)
         return
@@ -383,6 +442,9 @@ async def handle_text(phone: str, text: str):
 async def command(phone: str, text: str):
     parts = text.split(maxsplit=1)
     cmd = parts[0].lower()
+
+    # a new command while a quiz is running = the user left it: keep the score they had so far
+    abandon_quiz(phone, (db.get_user(phone) or {}).get("state"), f"command {cmd}")
 
     # --- /chat_pdf: start, and leave (any other command ends the PDF chat and deletes the PDF) ---
     if cmd == "/chat_pdf":
@@ -521,7 +583,9 @@ async def command(phone: str, text: str):
             "topic": topic,
             "questions": questions,
             "current_index": 0,
-            "score": 0
+            "score": 0,
+            "started_at": time.time(),
+            "updated_at": time.time(),
         }
         db.save_state(phone, quiz_state)
         await send_next_question(phone, quiz_state)
@@ -576,8 +640,21 @@ async def process_message(message: dict):
         logger.info(f"Message ID [{msg_id}] already processed. Skipping duplicate.")
         return
 
+    # "/cancel" must work WHILE a job is running, so it is handled before waiting for the user's lock.
+    if message.get("type") == "text":
+        said = ((message.get("text") or {}).get("body") or "").strip()
+        if said and job_control.is_cancel(said) and job_control.busy(phone):
+            await job_control.cancel(phone)
+            abandon_quiz(phone, (db.get_user(phone) or {}).get("state"), "cancel")
+            db.save_state(phone, {})
+            analytics.log_event(phone, "command", command="/cancel", success=True)
+            await wa.text(phone, "🛑 Stopped. Whatever was running has been cancelled.")
+            await wa.menu(phone)
+            return
+
     lock = locks.setdefault(phone, asyncio.Lock())
-    async with lock:
+
+    async def _locked():
         msg_type = message.get("type")
         if msg_type == "document":
             user = db.get_user(phone)
@@ -670,6 +747,28 @@ async def process_message(message: dict):
                     success=ok, response_time_ms=elapsed_ms
                 )
 
+    async with lock:
+        job_control.register(phone)
+        try:
+            await asyncio.wait_for(_locked(), JOB_MAX_SECONDS)
+        except asyncio.TimeoutError:
+            # a job that runs far too long would hold the user's lock and make the bot look dead: stop it
+            logger.error("Job for %s exceeded %ss and was stopped", phone, JOB_MAX_SECONDS)
+            abandon_quiz(phone, (db.get_user(phone) or {}).get("state"), "job timeout")
+            db.save_state(phone, {})
+            try:
+                await wa.text(phone, "⏱️ That took too long, so I stopped it. Please try again with a smaller request.")
+                await wa.menu(phone)
+            except Exception:
+                pass
+        except asyncio.CancelledError:
+            if job_control.consume_cancel(phone):            # cancelled by the user's /cancel: not an error
+                logger.info("Job for %s cancelled by the user", phone)
+                return
+            raise
+        finally:
+            job_control.unregister(phone)
+
 
 @app.get("/webhook")
 async def verify(request: Request):
@@ -712,5 +811,12 @@ async def webhook(request: Request, bg_tasks: BackgroundTasks):
             value = change.get("value", {})
             for msg in value.get("messages", []):
                 bg_tasks.add_task(process_message, msg)
+            for st in value.get("statuses", []):          # delivery receipts: the API says "sent", this says what really happened
+                if st.get("status") == "failed":
+                    err = (st.get("errors") or [{}])[0]
+                    logger.error("WhatsApp DELIVERY FAILED to %s: code=%s title=%s detail=%s", st.get("recipient_id"),
+                                 err.get("code"), err.get("title"), (err.get("error_data") or {}).get("details") or err.get("message"))
+                    analytics.log_event(st.get("recipient_id") or "unknown", "error", command="whatsapp_delivery",
+                                        meta={"stage": "delivery", "message": f"{err.get('code')}: {err.get('title')}"}, success=False)
 
     return {"status": "accepted"}
