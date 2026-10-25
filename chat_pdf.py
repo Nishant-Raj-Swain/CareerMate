@@ -1,7 +1,67 @@
+# chat_pdf.py
+# ---------------------------------------------------------------------------
+# /chat_pdf  -  let a WhatsApp user send a PDF and then chat with it (RAG).
+#
+# Pipeline
+#   PDF bytes -> text per page (pypdf) -> overlapping chunks (page-tagged)
+#     -> embeddings (Gemini or NVIDIA NIM, whichever key you have)
+#     -> stored in Postgres (your Supabase DB, via database.get_connection())
+#   question  -> (follow-up rewrite) -> hybrid retrieval: vector cosine + BM25,
+#                merged with Reciprocal Rank Fusion -> top excerpts
+#     -> LLM (NVIDIA NIM Kimi -> OpenRouter -> Gemini fallback chain)
+#     -> short WhatsApp-formatted answer with page citations
+#
+# If no embedding provider is reachable, retrieval silently falls back to
+# BM25 keyword search, so the feature keeps working.
+#
+# No new infrastructure: no pgvector, no vector DB, no torch. Embeddings are
+# stored as DOUBLE PRECISION[] and compared in Python (a PDF is a few hundred
+# chunks at most). Needs only: requests, pypdf, psycopg2 (and optionally numpy).
+#
+# Environment variables (all optional except at least one LLM key)
+#   GEMINI_API_KEY / GOOGLE_API_KEY      embeddings + LLM fallback
+#   NVIDIA_API_KEY / NIM_API_KEY         embeddings fallback + main LLM
+#   OPENROUTER_API_KEY                   LLM fallback
+#   CHAT_PDF_NVIDIA_MODEL                default moonshotai/kimi-k2-instruct
+#   CHAT_PDF_OPENROUTER_MODEL            default google/gemini-2.0-flash-001
+#   CHAT_PDF_GEMINI_MODEL                default gemini-2.5-flash, then gemini-2.5-flash-lite (comma list; add gemini-3.x names here
+#                                        if your key is refused for 2.5)
+#   CHAT_PDF_GEMINI_THINKING             thinking level for gemini-3*: minimal|low (default)|medium|high|off
+#   CHAT_PDF_GEMINI_EMBED_MODEL          default gemini-embedding-001
+#   CHAT_PDF_NVIDIA_EMBED_MODEL          default nvidia/nv-embedqa-e5-v5
+#   NVIDIA_BASE_URL / OPENROUTER_BASE_URL / GEMINI_BASE_URL   endpoint overrides
+#   CHAT_PDF_MAX_MB (10)  CHAT_PDF_MAX_PAGES (150)  CHAT_PDF_TTL_DAYS (7)
+#   CHAT_PDF_MAX_Q_PER_HOUR (40)  CHAT_PDF_MAX_Q_PER_DAY (60)
+#
+# Low-AI-usage design (every step below avoids a paid / rate-limited call):
+#   * a PDF is hashed (SHA-256); the same file is never parsed or embedded twice (chunks + vectors are copied)
+#   * embeddings: LOCAL first (pip install fastembed; CHAT_PDF_EMBED_PROVIDERS=local,gemini,nvidia; "off" = BM25 only)
+#   * one batched embedding request per PDF at upload, none at question time except the question itself (cached)
+#   * follow-up questions are rewritten by a rule (no LLM call); exactly ONE LLM call per answer
+#   * identical question on the same PDF is answered from a cache (no calls at all)
+#   * top-5 chunks, last 2 turns, max_tokens 500; a provider that answers 429 is skipped for 60 s
+#   * LLM fallback chain (CHAT_PDF_LLM_ORDER, default groq,cerebras,mistral,sambanova,nvidia,cloudflare,openrouter,gemini):
+#     every provider -> every model -> every key (comma-separated keys rotate) is tried until one answers.
+#     Keys: GROQ_API_KEY CEREBRAS_API_KEY MISTRAL_API_KEY SAMBANOVA_API_KEY NVIDIA_API_KEY CLOUDFLARE_API_TOKEN +
+#     CLOUDFLARE_ACCOUNT_ID OPENROUTER_API_KEY GEMINI_API_KEY.  Models: CHAT_PDF_<PROVIDER>_MODELS (comma list)
+#     Embedding fallbacks also: JINA_API_KEY, MISTRAL_API_KEY.  CHAT_PDF_MAX_TOKENS (500)
+# Model names are defaults; providers rename models, so override them with
+# the env vars above if one stops working.
+#
+# Public API used by main.py (see the integration notes in the README):
+#   chat_pdf.init()                                    once at startup
+#   await chat_pdf.start(phone)            -> str       /chat_pdf
+#   await chat_pdf.handle_document(phone, filename, content, caption=None) -> [str]
+#   await chat_pdf.handle_question(phone, text, notify=None) -> [str]   questions AND summaries
+#   await chat_pdf.exit(phone)             -> str       /exit
+#   chat_pdf.is_active(state)              -> bool
+#   chat_pdf.purge_user(phone)                          optional, e.g. from /delete
+# ---------------------------------------------------------------------------
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import io
 import json
 import logging
@@ -31,8 +91,10 @@ MAX_CHUNKS = 800
 MIN_TEXT_CHARS = 200            # below this we treat the PDF as a scan / image
 CHUNK_CHARS = 1000
 CHUNK_OVERLAP = 150
-TOP_K = 6
-HISTORY_TURNS = 4               # Q/A pairs sent back to the model
+TOP_K = int(os.getenv("CHAT_PDF_TOP_K", "5"))
+HISTORY_TURNS = 2               # Q/A pairs sent back to the model
+ANSWER_TOKENS = int(os.getenv("CHAT_PDF_MAX_TOKENS", "500"))
+MAX_Q_PER_DAY = int(os.getenv("CHAT_PDF_MAX_Q_PER_DAY", "60"))
 DOC_TTL_DAYS = int(os.getenv("CHAT_PDF_TTL_DAYS", "7"))
 MAX_Q_PER_HOUR = int(os.getenv("CHAT_PDF_MAX_Q_PER_HOUR", "40"))
 WA_LIMIT = 3800                 # WhatsApp text limit is 4096
@@ -69,6 +131,22 @@ def _openrouter_key() -> str:
     return _env("OPENROUTER_API_KEY")
 
 
+def _groq_key() -> str:
+    return _env("GROQ_API_KEY")
+
+
+def _cerebras_key() -> str:
+    return _env("CEREBRAS_API_KEY")
+
+
+def _groq_base() -> str:
+    return (_env("GROQ_BASE_URL") or "https://api.groq.com/openai/v1").rstrip("/")
+
+
+def _cerebras_base() -> str:
+    return (_env("CEREBRAS_BASE_URL") or "https://api.cerebras.ai/v1").rstrip("/")
+
+
 def _gemini_base() -> str:
     return (_env("GEMINI_BASE_URL") or "https://generativelanguage.googleapis.com").rstrip("/")
 
@@ -87,7 +165,9 @@ def _post(url: str, headers: dict, payload: dict, timeout: float = 60, retries: 
     for attempt in range(retries + 1):
         try:
             r = requests.post(url, headers=headers, json=payload, timeout=timeout)
-            if r.status_code == 429 or r.status_code >= 500:
+            if r.status_code == 429:                       # quota hit: let llm()/embed() move to the next provider
+                raise ProviderError(f"HTTP 429: {r.text[:120]}")
+            if r.status_code >= 500:
                 last = f"HTTP {r.status_code}"
                 time.sleep(1.5 * (attempt + 1))
                 continue
@@ -142,23 +222,98 @@ def _embed_nvidia(texts: list[str], task: str) -> tuple[list[list[float]], str]:
     return out, f"nvidia:{model}"
 
 
+def _embed_compat(name: str, base: str, key: str, model: str, texts: list[str], task: str, batch: int = 32):
+    """OpenAI-style /embeddings (Mistral, Jina ...)."""
+    out = []
+    for i in range(0, len(texts), batch):
+        payload = {"model": model, "input": texts[i:i + batch]}
+        if name == "jina":
+            payload["task"] = "retrieval.passage" if task == "passage" else "retrieval.query"
+        data = _post(f"{base}/embeddings", {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}, payload)
+        rows = sorted(data.get("data") or [], key=lambda r: r.get("index", 0))
+        if len(rows) != len(texts[i:i + batch]):
+            raise ProviderError(f"{name} embeddings: wrong count")
+        out += [_unit(r["embedding"]) for r in rows]
+    return out, f"{name}:{model}"
+
+
+def _embed_mistral(texts, task):
+    return _embed_compat("mistral", "https://api.mistral.ai/v1", _env("MISTRAL_API_KEY").split(",")[0].strip(),
+                         _env("CHAT_PDF_MISTRAL_EMBED_MODEL") or "mistral-embed", texts, task)
+
+
+def _embed_jina(texts, task):
+    return _embed_compat("jina", "https://api.jina.ai/v1", _env("JINA_API_KEY").split(",")[0].strip(),
+                         _env("CHAT_PDF_JINA_EMBED_MODEL") or "jina-embeddings-v3", texts, task)
+
+
+_LOCAL = {"model": None, "failed": False}
+_LOCAL_LOCK = threading.Lock()
+LOCAL_EMBED_MODEL = os.getenv("CHAT_PDF_LOCAL_EMBED_MODEL", "BAAI/bge-small-en-v1.5")
+
+
+def _local_available() -> bool:
+    if _LOCAL["failed"]:
+        return False
+    try:
+        import fastembed  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def _embed_local(texts: list[str], task: str) -> tuple[list[list[float]], str]:
+    """On-server embeddings (fastembed / ONNX, no torch, no API, no limits). pip install fastembed"""
+    with _LOCAL_LOCK:
+        if _LOCAL["model"] is None:
+            try:
+                from fastembed import TextEmbedding
+                _LOCAL["model"] = TextEmbedding(LOCAL_EMBED_MODEL)
+            except Exception as e:
+                _LOCAL["failed"] = True
+                raise ProviderError(f"local embeddings unavailable: {e}")
+        model = _LOCAL["model"]
+        fn = model.query_embed if task == "query" and hasattr(model, "query_embed") else model.embed
+        vecs = [_unit([float(x) for x in v]) for v in fn(texts)]
+    if len(vecs) != len(texts):
+        raise ProviderError("local embeddings: wrong count")
+    return vecs, "local:" + LOCAL_EMBED_MODEL.split("/")[-1]
+
+
+_QCACHE: "OrderedDict[tuple, list]" = OrderedDict()
+
+
 def embed(texts: list[str], task: str, only_tag: str | None = None):
-    """Returns (vectors, model_tag) or (None, None) if no provider works.
-    `only_tag` pins the provider (queries must use the doc's embedding model)."""
-    providers = []
-    if _gemini_key():
-        providers.append(("gemini", _embed_gemini))
-    if _nvidia_key():
-        providers.append(("nvidia", _embed_nvidia))
+    """Returns (vectors, model_tag) or (None, None) if no provider works (then search is BM25-only).
+    `only_tag` pins the provider (queries must use the doc's embedding model).
+    CHAT_PDF_EMBED_PROVIDERS = comma list from local,gemini,jina,mistral,nvidia ('off' = never embed)."""
+    order = [x.strip() for x in (_env("CHAT_PDF_EMBED_PROVIDERS") or "local,gemini,jina,mistral,nvidia").lower().split(",") if x.strip()]
+    if "off" in order:
+        return None, None
+    avail = {"local": (_local_available, _embed_local), "gemini": (lambda: bool(_gemini_key()), _embed_gemini),
+             "nvidia": (lambda: bool(_nvidia_key()), _embed_nvidia),
+             "mistral": (lambda: bool(_env("MISTRAL_API_KEY")), _embed_mistral),
+             "jina": (lambda: bool(_env("JINA_API_KEY")), _embed_jina)}
+    providers = [(n, avail[n][1]) for n in order if n in avail and avail[n][0]()]
     if only_tag:
         providers = [p for p in providers if only_tag.startswith(p[0] + ":")]
+        if task == "query" and len(texts) == 1 and (only_tag, texts[0]) in _QCACHE:   # same question embedded before
+            return [_QCACHE[(only_tag, texts[0])]], only_tag
     for name, fn in providers:
+        t_try = time.perf_counter()
         try:
             vecs, tag = fn(texts, task)
+            if task != "query":                     # per-question embeddings are not logged (they'd flood the table)
+                _track("embed", name, tag, True, int((time.perf_counter() - t_try) * 1000))
             if only_tag and tag != only_tag:      # model was changed via env since ingest
                 continue
+            if task == "query" and len(texts) == 1:
+                _QCACHE[(tag, texts[0])] = vecs[0]
+                while len(_QCACHE) > 300:
+                    _QCACHE.popitem(last=False)
             return vecs, tag
         except Exception as e:
+            _track("embed", name, name, False, int((time.perf_counter() - t_try) * 1000), str(e))
             log.warning("embedding provider %s failed: %s", name, e)
     return None, None
 
@@ -178,14 +333,20 @@ def _chat_openai(base: str, key: str, model: str, messages: list[dict], max_toke
 
 
 def _gemini_model() -> str:
-    return _env("CHAT_PDF_GEMINI_MODEL") or "gemini-3.6-flash"
+    return _models_of("gemini", PROVIDERS["gemini"])[0]               # default gemini-2.5-flash
 
 
-def _chat_gemini(messages: list[dict], max_tokens: int) -> str:
+def gemini_candidates() -> list[tuple[str, str]]:
+    """[(model, key)] for things only Gemini can do (e.g. reading a YouTube video): every Gemini model x every key."""
+    p = PROVIDERS["gemini"]
+    return [(m, k) for m in _models_of("gemini", p) for k in _keys_of(p)]
+
+
+def _chat_gemini(messages: list[dict], max_tokens: int, model: str | None = None, key: str | None = None) -> str:
     """Gemini 3.x notes (from Google's docs): thinking tokens count against the output cap, so a small
     cap can produce an empty reply, and sampling params should be left at their defaults. So for gemini-3*
     we use a low thinking level, a roomy cap and no temperature."""
-    model = _gemini_model()
+    model = model or _gemini_model()
     is3 = model.startswith("gemini-3")
     system = "\n\n".join(m["content"] for m in messages if m["role"] == "system")
     contents = [{"role": "model" if m["role"] == "assistant" else "user", "parts": [{"text": m["content"]}]}
@@ -200,7 +361,7 @@ def _chat_gemini(messages: list[dict], max_tokens: int) -> str:
     if is3 and level.lower() != "off":
         gen["thinkingConfig"] = {"thinkingLevel": level}
     url = f"{_gemini_base()}/v1beta/models/{model}:generateContent"
-    headers = {"x-goog-api-key": _gemini_key(), "Content-Type": "application/json"}
+    headers = {"x-goog-api-key": key or _gemini_key(), "Content-Type": "application/json"}
     try:
         data = _post(url, headers, body, timeout=75)
     except ProviderError as e:
@@ -219,32 +380,142 @@ def _chat_gemini(messages: list[dict], max_tokens: int) -> str:
     return text
 
 
-def llm(messages: list[dict], max_tokens: int = 700) -> str:
-    """Tries NVIDIA NIM (Kimi) -> OpenRouter -> Gemini. Raises ProviderError if all fail."""
-    attempts = []
-    if _nvidia_key():
-        attempts.append(("nvidia", lambda: _chat_openai(
-            _nvidia_base(), _nvidia_key(), _env("CHAT_PDF_NVIDIA_MODEL") or "moonshotai/kimi-k2-instruct",
-            messages, max_tokens)))
-    if _openrouter_key():
-        attempts.append(("openrouter", lambda: _chat_openai(
-            _openrouter_base(), _openrouter_key(), _env("CHAT_PDF_OPENROUTER_MODEL") or "google/gemini-2.0-flash-001",
-            messages, max_tokens, {"X-Title": "CareerMate"})))
-    if _gemini_key():
-        attempts.append(("gemini", lambda: _chat_gemini(messages, max_tokens)))
-    if not attempts:
+def _track(kind: str, provider: str, model: str, ok: bool, ms: int, err: str = "") -> None:
+    """One row per provider attempt, for the admin 'AI Providers' page. Never raises, never logs keys."""
+    try:
+        _ensure()
+        err = re.sub(r"(key|token|bearer)[=: ]+\S+", r"\1=***", err or "", flags=re.I)[:300]
+        with db.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("INSERT INTO ai_provider_log (kind, provider, model, ok, ms, error) VALUES (%s,%s,%s,%s,%s,%s)",
+                            (kind, provider, model, bool(ok), int(ms), err))
+            conn.commit()
+    except Exception:
+        pass
+
+
+# ------------------------------------------------ provider registry (every provider / model / key is a fallback)
+# name -> (env var(s) holding the key(s), base URL, default models). Keys may be a comma list (rotated), and
+# CHAT_PDF_<NAME>_MODELS (comma list) overrides the models. Model names change often: a wrong or retired name
+# just fails fast and the next model/provider is used.
+def _cf_base() -> str:
+    acct = _env("CLOUDFLARE_ACCOUNT_ID")
+    return f"https://api.cloudflare.com/client/v4/accounts/{acct}/ai/v1" if acct else ""
+
+
+PROVIDERS: dict[str, dict] = {
+    "groq": {"keys": ("GROQ_API_KEY",), "base": lambda: _groq_base(),
+             "models": ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.3-70b-versatile"]},
+    "cerebras": {"keys": ("CEREBRAS_API_KEY",), "base": lambda: _cerebras_base(),
+                 "models": ["gpt-oss-120b", "llama3.1-8b"]},
+    "mistral": {"keys": ("MISTRAL_API_KEY",), "base": lambda: (_env("MISTRAL_BASE_URL") or "https://api.mistral.ai/v1").rstrip("/"),
+                "models": ["mistral-small-latest"]},
+    "sambanova": {"keys": ("SAMBANOVA_API_KEY",), "base": lambda: (_env("SAMBANOVA_BASE_URL") or "https://api.sambanova.ai/v1").rstrip("/"),
+                  "models": ["Meta-Llama-3.3-70B-Instruct"]},
+    "nvidia": {"keys": ("NVIDIA_API_KEY", "NIM_API_KEY"), "base": lambda: _nvidia_base(),
+               "models": ["moonshotai/kimi-k2-instruct", "meta/llama-3.3-70b-instruct"]},
+    "cloudflare": {"keys": ("CLOUDFLARE_API_TOKEN",), "base": _cf_base,
+                   "models": ["@cf/meta/llama-3.1-8b-instruct"]},
+    "openrouter": {"keys": ("OPENROUTER_API_KEY",), "base": lambda: _openrouter_base(), "headers": {"X-Title": "CareerMate"},
+                   "models": ["openai/gpt-oss-120b:free", "meta-llama/llama-3.3-70b-instruct:free", "google/gemini-2.0-flash-001"]},
+    "gemini": {"keys": ("GEMINI_API_KEY", "GOOGLE_API_KEY"), "gemini": True, "models": ["gemini-2.5-flash", "gemini-2.5-flash-lite"]},
+}
+DEFAULT_ORDER = "groq,cerebras,mistral,sambanova,nvidia,cloudflare,openrouter,gemini"
+_COOLDOWN: dict[str, float] = {}
+MAX_PER_PROVIDER = int(os.getenv("CHAT_PDF_TRIES_PER_PROVIDER", "3"))   # models/keys tried inside one provider before moving on
+
+
+def _keys_of(p: dict) -> list[str]:
+    for n in p["keys"]:
+        v = _env(n)
+        if v:
+            return [k.strip() for k in v.split(",") if k.strip()]
+    return []
+
+
+def _models_of(name: str, p: dict) -> list[str]:
+    if name == "nvidia" and _env("CHAT_PDF_NVIDIA_MODEL"):                 # backwards compatible single-model vars
+        return [_env("CHAT_PDF_NVIDIA_MODEL")]
+    one = {"openrouter": "CHAT_PDF_OPENROUTER_MODEL", "gemini": "CHAT_PDF_GEMINI_MODEL",
+           "groq": "CHAT_PDF_GROQ_MODEL", "cerebras": "CHAT_PDF_CEREBRAS_MODEL"}.get(name)
+    raw = _env(f"CHAT_PDF_{name.upper()}_MODELS") or (_env(one) if one else "")
+    return [m.strip() for m in raw.split(",") if m.strip()] or p["models"]
+
+
+def llm_plan() -> list[tuple[str, str, str]]:
+    """[(provider, model, key)] in the order they will be tried. Keys rotate each call to spread the quota."""
+    order = [x.strip() for x in (_env("CHAT_PDF_LLM_ORDER") or DEFAULT_ORDER).lower().split(",") if x.strip()]
+    plan = []
+    for name in order:
+        p = PROVIDERS.get(name)
+        if not p:
+            continue
+        keys = _keys_of(p)
+        if not keys or (not p.get("gemini") and not p["base"]()):
+            continue
+        rot = int(time.time() // 1) % len(keys)
+        keys = keys[rot:] + keys[:rot]
+        for m in _models_of(name, p):
+            for k in keys:
+                plan.append((name, m, k))
+    return plan
+
+
+def _cool(tag: str, err: str) -> None:
+    e = err.lower()
+    if any(x in e for x in ("401", "403", "invalid api key", "unauthorized", "permission")):
+        _COOLDOWN["key|" + tag.split("|")[0] + "|" + tag.split("|")[2]] = time.time() + 1800   # bad key: skip it for every model
+        return
+    if "429" in e or "rate" in e or "quota" in e:
+        sec = 60                                                          # per-minute / daily quota
+    elif any(x in e for x in ("401", "403", "invalid api key", "unauthorized", "permission")):
+        sec = 1800                                                        # bad / disabled key
+    elif any(x in e for x in ("404", "not found", "model", "decommission", "deprecat")):
+        sec = 600                                                         # wrong or retired model name
+    elif "413" in e or "too large" in e or "context" in e or "tokens" in e:
+        sec = 0                                                           # this prompt is too big for it; others may cope
+    else:
+        sec = 30
+    if sec:
+        _COOLDOWN[tag] = time.time() + sec
+
+
+def llm(messages: list[dict], max_tokens: int = ANSWER_TOKENS) -> str:
+    """Makes ONE successful call. Walks provider -> model -> key until one answers; each failure puts that
+    (provider, model, key) on a short cooldown so it is not retried straight away. Raises ProviderError only
+    when every configured option failed."""
+    plan = llm_plan()
+    if not plan:
         raise ProviderError("no AI provider key configured")
-    errors = []
-    for name, fn in attempts:
+    now = time.time()
+    live = [x for x in plan if _COOLDOWN.get("%s|%s|%s" % (x[0], x[1], x[2][-6:]), 0) <= now
+            and _COOLDOWN.get("key|%s|%s" % (x[0], x[2][-6:]), 0) <= now] or plan
+    errors, tried, per = [], 0, {}
+    for name, model, key in live:
+        if per.get(name, 0) >= MAX_PER_PROVIDER:
+            continue
+        per[name] = per.get(name, 0) + 1
+        tag = "%s|%s|%s" % (name, model, key[-6:])
+        tried += 1
+        t_try = time.perf_counter()
         try:
-            text = fn()
+            p = PROVIDERS[name]
+            if p.get("gemini"):
+                text = _chat_gemini(messages, max_tokens, model=model, key=key)
+            else:
+                text = _chat_openai(p["base"](), key, model, messages, max_tokens, p.get("headers"))
+            _track("llm", name, model, bool(text), int((time.perf_counter() - t_try) * 1000), "" if text else "empty reply")
             if text:
+                if tried > 1:
+                    log.info("LLM answered via %s/%s after %d failed attempt(s)", name, model, tried - 1)
                 return text
-            errors.append(f"{name}: empty reply")
+            errors.append(f"{name}/{model}: empty reply")
         except Exception as e:
-            errors.append(f"{name}: {e}")
-            log.warning("LLM provider %s failed: %s", name, e)
-    raise ProviderError("; ".join(errors))
+            errors.append(f"{name}/{model}: {str(e)[:120]}")
+            _track("llm", name, model, False, int((time.perf_counter() - t_try) * 1000), str(e))
+            _cool(tag, str(e))
+            log.warning("LLM %s/%s failed: %s", name, model, str(e)[:160])
+    raise ProviderError("; ".join(errors)[:900])
 
 
 # ----------------------------------------------------------- PDF -> chunks
@@ -360,8 +631,8 @@ def _tokens(text: str) -> list[str]:
 class DocIndex:
     """In-memory index for one document: chunks, optional embeddings, BM25 stats."""
 
-    def __init__(self, doc_id, filename, pages, chunks, embeddings, embed_tag):
-        self.doc_id, self.filename, self.pages = doc_id, filename, pages
+    def __init__(self, doc_id, filename, pages, chunks, embeddings, embed_tag, sha=None):
+        self.doc_id, self.filename, self.pages, self.sha = doc_id, filename, pages, sha
         self.chunks = chunks
         self.embed_tag = embed_tag
         self.matrix = None
@@ -630,26 +901,22 @@ def build_messages(index: DocIndex, question: str, picked: list[int], history: l
     msgs = [{"role": "system", "content": SYSTEM_PROMPT}]
     for turn in history[-HISTORY_TURNS:]:
         msgs.append({"role": "user", "content": turn["q"]})
-        msgs.append({"role": "assistant", "content": turn["a"]})
+        msgs.append({"role": "assistant", "content": turn["a"][:500]})
     msgs.append({"role": "user", "content": (
         f"Document: {index.filename} ({index.pages} pages)\n\nExcerpts:\n{excerpts}\n\nQuestion: {question}")})
     return msgs
 
 
+def is_followup(question: str, history: list[dict]) -> bool:
+    return bool(history) and (len(question.split()) <= 9 or bool(_FOLLOWUP.search(question)))
+
+
 def standalone_question(question: str, history: list[dict]) -> str:
-    """Rewrites a short follow-up ('and what about the second one?') into a self-contained query."""
-    if not history or not (len(question.split()) <= 9 or _FOLLOWUP.search(question)):
+    """Follow-up ('and what about the second one?') -> search query by a RULE (no LLM call): the previous
+    question's words are added so keyword + vector search still know the topic."""
+    if not is_followup(question, history):
         return question
-    convo = "\n".join(f"User: {t['q']}\nAssistant: {t['a'][:300]}" for t in history[-2:])
-    try:
-        out = llm([
-            {"role": "system", "content": "Rewrite the user's last message as one standalone search query that "
-             "makes sense without the conversation. Keep the same language. Output only the query."},
-            {"role": "user", "content": f"{convo}\nUser: {question}\n\nStandalone query:"}], max_tokens=80)
-        out = out.strip().strip('"')
-        return out if 3 <= len(out) <= 300 else question
-    except Exception:
-        return question
+    return (history[-1]["q"] + " " + question)[:400]
 
 
 def to_whatsapp(text: str) -> str:
@@ -671,19 +938,52 @@ def split_message(text: str, limit: int = WA_LIMIT) -> list[str]:
     return parts + ([text] if text else [])
 
 
-def answer_with_index(index: DocIndex, question: str, history: list[dict]) -> tuple[str, list[int]]:
-    """Synchronous core: retrieve + generate. Returns (answer, chunk indexes used)."""
+_ACACHE: "OrderedDict[tuple, tuple]" = OrderedDict()      # (pdf sha, normalised question) -> (reply, chunks, time)
+_ACACHE_LOCK = threading.Lock()
+ACACHE_MAX, ACACHE_TTL = 300, 86400
+
+
+def _qkey(index: "DocIndex", question: str):
+    if not index.sha:
+        return None
+    return (index.sha, re.sub(r"[^\w ]+", "", question.lower()).strip(), _env("CHAT_PDF_LLM_ORDER"))
+
+
+def answer_with_index(index: DocIndex, question: str, history: list[dict], stats: dict | None = None) -> tuple[str, list[int]]:
+    """Synchronous core: retrieve + generate (ONE model call). Returns (answer, chunk indexes used).
+    Identical questions on the same PDF (same SHA-256) are answered from cache; `stats` (optional dict) gets
+    {"cached": bool, "llm_calls": int}."""
+    stats = stats if stats is not None else {}
+    stats.update(cached=False, llm_calls=0)
+    key = None if is_followup(question, history) else _qkey(index, question)
+    if key:
+        with _ACACHE_LOCK:
+            hit = _ACACHE.get(key)
+            if hit and time.time() - hit[2] < ACACHE_TTL:
+                _ACACHE.move_to_end(key)
+                stats["cached"] = True
+                return hit[0], hit[1]
+    ok = True
     if is_summary_request(question):
-        return summarize_index(index, question), []
-    picked = retrieve(index, standalone_question(question, history))
-    picked = sorted(picked, key=lambda i: index.chunks[i]["page"] * 10000 + i)  # reading order
-    try:
-        reply = to_whatsapp(llm(build_messages(index, question, picked, history)))
-    except ProviderError as e:
-        log.error("all LLM providers failed: %s", e)
-        top = picked[:3]
-        reply = ("⚠️ My AI service is busy right now, so here are the most relevant passages from your PDF:\n\n" +
-                 "\n\n".join(f"*Page {index.chunks[i]['page']}*\n{index.chunks[i]['text'][:500]}" for i in top))
+        reply, picked = summarize_index(index, question), []
+        stats["llm_calls"] = 1
+    else:
+        picked = retrieve(index, standalone_question(question, history))
+        picked = sorted(picked, key=lambda i: index.chunks[i]["page"] * 10000 + i)  # reading order
+        try:
+            reply = to_whatsapp(llm(build_messages(index, question, picked, history)))
+            stats["llm_calls"] = 1
+        except ProviderError as e:
+            ok = False
+            log.error("all LLM providers failed: %s", e)
+            top = picked[:3]
+            reply = ("⚠️ My AI service is busy right now, so here are the most relevant passages from your PDF:\n\n" +
+                     "\n\n".join(f"*Page {index.chunks[i]['page']}*\n{index.chunks[i]['text'][:500]}" for i in top))
+    if key and ok and not reply.startswith("⚠️"):
+        with _ACACHE_LOCK:
+            _ACACHE[key] = (reply, picked, time.time())
+            while len(_ACACHE) > ACACHE_MAX:
+                _ACACHE.popitem(last=False)
     return reply, picked
 
 
@@ -707,6 +1007,13 @@ def init() -> None:
                                   doc_id INTEGER NOT NULL REFERENCES chat_pdf_docs(id) ON DELETE CASCADE,
                                   idx INTEGER NOT NULL, page INTEGER NOT NULL, text TEXT NOT NULL,
                                   embedding DOUBLE PRECISION[])""")
+                cur.execute("""CREATE TABLE IF NOT EXISTS ai_provider_log (
+                                  id SERIAL PRIMARY KEY, ts TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                                  kind TEXT, provider TEXT, model TEXT, ok BOOLEAN, ms INTEGER, error TEXT)""")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_apl_ts ON ai_provider_log(ts)")
+                cur.execute("DELETE FROM ai_provider_log WHERE ts < NOW() - INTERVAL '30 days'")
+                cur.execute("ALTER TABLE chat_pdf_docs ADD COLUMN IF NOT EXISTS sha TEXT")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_cpd_sha ON chat_pdf_docs(sha)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_cpd_phone ON chat_pdf_docs(phone)")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_cpc_doc ON chat_pdf_chunks(doc_id, idx)")
                 cur.execute("DELETE FROM chat_pdf_docs WHERE created_at < NOW() - make_interval(days => %s)",
@@ -720,7 +1027,7 @@ def _ensure():
         init()
 
 
-def _save_doc(phone: str, filename: str, pages: int, chunks: list[dict], embeddings, tag) -> int:
+def _save_doc(phone: str, filename: str, pages: int, chunks: list[dict], embeddings, tag, sha: str | None = None) -> int:
     import psycopg2.extras
     _ensure()
     with db.get_connection() as conn:
@@ -728,8 +1035,8 @@ def _save_doc(phone: str, filename: str, pages: int, chunks: list[dict], embeddi
             cur.execute("DELETE FROM chat_pdf_docs WHERE phone = %s", (phone,))      # one active PDF per user
             cur.execute("DELETE FROM chat_pdf_docs WHERE created_at < NOW() - make_interval(days => %s)",
                         (DOC_TTL_DAYS,))
-            cur.execute("INSERT INTO chat_pdf_docs (phone, filename, pages, n_chunks, embed_tag) "
-                        "VALUES (%s,%s,%s,%s,%s) RETURNING id", (phone, filename, pages, len(chunks), tag))
+            cur.execute("INSERT INTO chat_pdf_docs (phone, filename, pages, n_chunks, embed_tag, sha) "
+                        "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id", (phone, filename, pages, len(chunks), tag, sha))
             doc_id = cur.fetchone()["id"]
             rows = [(doc_id, i, c["page"], c["text"], embeddings[i] if embeddings else None)
                     for i, c in enumerate(chunks)]
@@ -738,6 +1045,27 @@ def _save_doc(phone: str, filename: str, pages: int, chunks: list[dict], embeddi
                 rows, template="(%s,%s,%s,%s,%s::float8[])", page_size=100)
         conn.commit()
     return doc_id
+
+
+def _clone_doc(phone: str, sha: str, filename: str) -> tuple[int, int, int, str | None] | None:
+    """If a stored, unexpired document has the same SHA-256, copy its chunks + embeddings for this user
+    (no parsing, no embedding call). The copy belongs to `phone` only. Returns (doc_id, pages, n_chunks, embed_tag)."""
+    _ensure()
+    with db.get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT id, pages, n_chunks, embed_tag FROM chat_pdf_docs WHERE sha = %s "
+                        "AND created_at > NOW() - make_interval(days => %s) ORDER BY id DESC LIMIT 1", (sha, DOC_TTL_DAYS))
+            src = cur.fetchone()
+            if not src:
+                return None
+            cur.execute("DELETE FROM chat_pdf_docs WHERE phone = %s", (phone,))      # one active PDF per user
+            cur.execute("INSERT INTO chat_pdf_docs (phone, filename, pages, n_chunks, embed_tag, sha) "
+                        "VALUES (%s,%s,%s,%s,%s,%s) RETURNING id", (phone, filename, src["pages"], src["n_chunks"], src["embed_tag"], sha))
+            new_id = cur.fetchone()["id"]
+            cur.execute("INSERT INTO chat_pdf_chunks (doc_id, idx, page, text, embedding) "
+                        "SELECT %s, idx, page, text, embedding FROM chat_pdf_chunks WHERE doc_id = %s", (new_id, src["id"]))
+        conn.commit()
+    return new_id, src["pages"], src["n_chunks"], src["embed_tag"]
 
 
 def _delete_user_docs(phone: str) -> None:
@@ -764,7 +1092,7 @@ def _load_index(doc_id: int, phone: str) -> DocIndex | None:
     _ensure()
     with db.get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT filename, pages, embed_tag FROM chat_pdf_docs WHERE id = %s AND phone = %s",
+            cur.execute("SELECT filename, pages, embed_tag, sha FROM chat_pdf_docs WHERE id = %s AND phone = %s",
                         (doc_id, phone))
             d = cur.fetchone()
             if not d:
@@ -774,7 +1102,7 @@ def _load_index(doc_id: int, phone: str) -> DocIndex | None:
             rows = cur.fetchall()
     chunks = [{"page": r["page"], "text": r["text"]} for r in rows]
     embs = [r["embedding"] for r in rows] if rows and all(r["embedding"] for r in rows) else None
-    index = DocIndex(doc_id, d["filename"], d["pages"], chunks, embs, d["embed_tag"])
+    index = DocIndex(doc_id, d["filename"], d["pages"], chunks, embs, d["embed_tag"], d.get("sha"))
     with _CACHE_LOCK:
         _CACHE[doc_id] = index
         while len(_CACHE) > _CACHE_MAX:
@@ -789,6 +1117,7 @@ def _forget(doc_id) -> None:
 
 # ----------------------------------------------------------- rate limit
 _HITS: dict[str, deque] = defaultdict(deque)
+_DAY: dict[str, tuple[str, int]] = {}
 
 
 def _allowed(phone: str) -> bool:
@@ -798,6 +1127,12 @@ def _allowed(phone: str) -> bool:
         q.popleft()
     if len(q) >= MAX_Q_PER_HOUR:
         return False
+    day, n = _DAY.get(phone, (time.strftime("%Y-%m-%d"), 0))
+    if day != time.strftime("%Y-%m-%d"):
+        n = 0
+    if n >= MAX_Q_PER_DAY:
+        return False
+    _DAY[phone] = (time.strftime("%Y-%m-%d"), n + 1)
     q.append(now)
     return True
 
@@ -840,7 +1175,23 @@ async def handle_document(phone: str, filename: str, content: bytes, caption: st
         return [f"❌ That file is {len(content) / 1048576:.1f} MB. The limit is "
                 f"{MAX_FILE_BYTES // 1048576} MB. Please send a smaller PDF."]
     t0 = time.perf_counter()
+    sha = hashlib.sha256(content).hexdigest()
     try:
+        cloned = await asyncio.to_thread(_clone_doc, phone, sha, filename)            # same file seen before: no AI, no parsing
+        if cloned:
+            doc_id, n_pages, n_chunks, tag = cloned
+            await asyncio.to_thread(db.save_state, phone, {
+                "mode": MODE, "doc_id": doc_id, "filename": filename, "pages": n_pages, "history": []})
+            _forget(doc_id)
+            _log(phone, stage="ingest", filename=filename, pages=n_pages, chunks=n_chunks, embeddings=bool(tag), reused=True,
+                 ms=int((time.perf_counter() - t0) * 1000))
+            out = [f"✅ *{filename}* is ready ({n_pages} page{'s' if n_pages != 1 else ''}).\n\n"
+                   "Ask me anything about it, for example:\n"
+                   "- _Summarize this document_\n- _What are the key points?_\n- _What does it say about …?_\n\n"
+                   "Send */exit* when you're done."]
+            if caption and caption.strip():
+                out += await handle_question(phone, caption.strip())
+            return out
         pages = await asyncio.to_thread(extract_pages, content)
         total_chars = sum(len(p.strip()) for p in pages)
         if total_chars < MIN_TEXT_CHARS:
@@ -852,7 +1203,7 @@ async def handle_document(phone: str, filename: str, content: bytes, caption: st
             _log(phone, ok=False, stage="ingest", filename=filename, message="no readable text")
             return ["❌ I couldn't find readable text in this PDF."]
         vecs, tag = await asyncio.to_thread(embed, [c["text"] for c in chunks], "passage")
-        doc_id = await asyncio.to_thread(_save_doc, phone, filename, len(pages), chunks, vecs, tag)
+        doc_id = await asyncio.to_thread(_save_doc, phone, filename, len(pages), chunks, vecs, tag, sha)
         await asyncio.to_thread(db.save_state, phone, {
             "mode": MODE, "doc_id": doc_id, "filename": filename, "pages": len(pages), "history": []})
         _forget(doc_id)
@@ -912,17 +1263,18 @@ async def handle_question(phone: str, text: str, notify=None) -> list[str]:
                 await notify("⏳ Reading all %d pages to summarise them. This can take up to a minute..." % index.pages)
             except Exception:
                 pass
-        reply, picked = await asyncio.to_thread(answer_with_index, index, text, history)
+        stats: dict = {}
+        reply, picked = await asyncio.to_thread(answer_with_index, index, text, history, stats)
     except Exception as e:
         log.exception("chat_pdf answer failed for %s", phone)
         _log(phone, ok=False, stage="answer", message=str(e)[:200])
         return ["⚠️ Something went wrong answering that. Please try again."]
 
-    history.append({"q": text[:500], "a": reply[:700]})
+    history.append({"q": text[:300], "a": reply[:500]})
     state["history"] = history[-HISTORY_TURNS:]
     await asyncio.to_thread(db.save_state, phone, state)
     _log(phone, stage="summary" if is_summary_request(text) else "answer", chunks_used=len(picked), reply_chars=len(reply),
-         ms=int((time.perf_counter() - t0) * 1000))
+         cached=bool(stats.get("cached")), llm_calls=stats.get("llm_calls", 0), ms=int((time.perf_counter() - t0) * 1000))
     return split_message(reply)
 
 
@@ -936,6 +1288,69 @@ async def exit(phone: str) -> str:
         _log(phone, stage="exit")                              # a session that was ended on purpose (admin analytics)
     await asyncio.to_thread(db.save_state, phone, {})
     return "👋 Chat ended and your PDF was deleted from my memory."
+
+
+def provider_status() -> dict:
+    """Configured providers (names only, never keys) + live cooldowns. Used by the admin 'AI Providers' page."""
+    now = time.time()
+    llm_rows = []
+    order = [x.strip() for x in (_env("CHAT_PDF_LLM_ORDER") or DEFAULT_ORDER).lower().split(",") if x.strip()]
+    for name in order:
+        p = PROVIDERS.get(name)
+        if not p:
+            continue
+        keys = _keys_of(p)
+        usable = bool(keys) and (p.get("gemini") or bool(p["base"]()))
+        for m in _models_of(name, p):
+            cd = max([_COOLDOWN.get("%s|%s|%s" % (name, m, k[-6:]), 0) for k in keys] + [0])
+            llm_rows.append({"provider": name, "model": m, "configured": usable, "keys": len(keys),
+                             "cooldown_s": max(0, int(cd - now)) if usable and all(
+                                 _COOLDOWN.get("%s|%s|%s" % (name, m, k[-6:]), 0) > now for k in keys) else 0})
+    emb = []
+    for n, (ok_fn) in (("local", _local_available), ("gemini", lambda: bool(_gemini_key())), ("jina", lambda: bool(_env("JINA_API_KEY"))),
+                       ("mistral", lambda: bool(_env("MISTRAL_API_KEY"))), ("nvidia", lambda: bool(_nvidia_key()))):
+        emb.append({"provider": n, "configured": bool(ok_fn())})
+    return {"llm": llm_rows, "embed": emb,
+            "embed_order": (_env("CHAT_PDF_EMBED_PROVIDERS") or "local,gemini,jina,mistral,nvidia"), "llm_order": ",".join(order)}
+
+
+def test_providers() -> list[dict]:
+    """Sends one tiny request to every configured provider (first model of each) and records the result.
+    Costs ~1 request per provider. Returns [{kind, provider, model, ok, ms, error}]."""
+    from concurrent.futures import ThreadPoolExecutor
+    jobs = []
+    for name, p in PROVIDERS.items():
+        keys = _keys_of(p)
+        if keys and (p.get("gemini") or p["base"]()):
+            for m in _models_of(name, p)[:1]:
+                jobs.append(("llm", name, m, keys[0]))
+    for n, fn, has in (("gemini", _embed_gemini, bool(_gemini_key())), ("jina", _embed_jina, bool(_env("JINA_API_KEY"))),
+                       ("mistral", _embed_mistral, bool(_env("MISTRAL_API_KEY"))), ("nvidia", _embed_nvidia, bool(_nvidia_key()))):
+        if has:
+            jobs.append(("embed", n, n, fn))
+    if _local_available():
+        jobs.append(("embed", "local", "local", _embed_local))
+
+    def run(j):
+        kind, name, model, extra = j
+        t0 = time.perf_counter()
+        try:
+            if kind == "llm":
+                p = PROVIDERS[name]
+                msgs = [{"role": "user", "content": "Reply with the single word: ok"}]
+                out = (_chat_gemini(msgs, 16, model=model, key=extra) if p.get("gemini")
+                       else _chat_openai(p["base"](), extra, model, msgs, 16, p.get("headers")))
+                ok, err = bool(out), "" if out else "empty reply"
+            else:
+                vecs, tag = extra(["ping"], "query")
+                ok, err = bool(vecs), ""
+        except Exception as e:
+            ok, err = False, str(e)
+        ms = int((time.perf_counter() - t0) * 1000)
+        _track(kind, name, model, ok, ms, err)
+        return {"kind": kind, "provider": name, "model": model, "ok": ok, "ms": ms, "error": re.sub(r"(key|token|bearer)[=: ]+\S+", r"\1=***", err, flags=re.I)[:200]}
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        return list(ex.map(run, jobs))
 
 
 def purge_user(phone: str) -> None:
