@@ -17,15 +17,13 @@ youtube-transcript-api
 reportlab
 pillow
 requests
-scikit-learn
+
 fastembed
 pymupdf
 psutil
 
 # Admin Dashboard & Analytics
-streamlit
-pandas
-matplotlib
-seaborn
+
 psycopg2-binary
 numpy
+scikit-learn
