@@ -686,3 +686,74 @@ def books_page(start: str | None = None, end: str | None = None) -> dict:
             "funnel": funnel,
             "delivery": {"found": found, "sent": sum(x["sent"] for x in sessions), "alts": sum(1 for x in sessions if x["status"] == "alts"), "none": failed},
             "top_books": top_books, "methods": methods, "method_total": mt, "recent": recent}
+
+
+# ======================================================================= AI Providers health (chat_pdf fallback chain)
+def ai_providers_page(start: str | None = None, end: str | None = None) -> dict:
+    """Which AI provider/model works right now, from the attempts chat_pdf logged (table ai_provider_log)."""
+    end = end or datetime.utcnow().strftime("%Y-%m-%d")
+    e = datetime.strptime(end, "%Y-%m-%d")
+    start = start or (e - timedelta(days=6)).strftime("%Y-%m-%d")
+    rows, recent = [], []
+    try:
+        import chat_pdf
+        conf = chat_pdf.provider_status()
+    except Exception:
+        conf = {"llm": [], "embed": [], "embed_order": "", "llm_order": ""}
+    with _conn() as conn:
+        try:
+            cur = conn.raw("""SELECT kind, provider, model, ok, ms, error,
+                                     to_char(ts AT TIME ZONE 'UTC','YYYY-MM-DD HH24:MI:SS') AS ts
+                                FROM ai_provider_log
+                               WHERE to_char(ts AT TIME ZONE 'UTC','YYYY-MM-DD') BETWEEN %s AND %s
+                               ORDER BY ts, id""", (start, end))
+            rows = cur.fetchall()
+        except Exception:
+            rows = []
+    now = datetime.utcnow()
+    by: dict[tuple, dict] = {}
+    for r in rows:
+        k = (r["kind"], r["provider"], r["model"] if r["kind"] == "llm" else r["provider"])
+        d = by.setdefault(k, {"kind": r["kind"], "provider": r["provider"], "model": k[2], "calls": 0, "ok": 0, "ms": [], "last": [],
+                              "last_ok": None, "last_fail": None, "last_error": ""})
+        d["calls"] += 1
+        d["ok"] += 1 if r["ok"] else 0
+        if r["ok"]:
+            d["ms"].append(r["ms"] or 0); d["last_ok"] = r["ts"]
+        else:
+            d["last_fail"] = r["ts"]; d["last_error"] = r["error"] or ""
+            recent.append({"time": r["ts"], "kind": r["kind"], "provider": r["provider"], "model": k[2], "error": r["error"] or "", "ms": r["ms"] or 0})
+        d["last"].append(bool(r["ok"]))
+    cool = {(x["provider"], x["model"]): x["cooldown_s"] for x in conf["llm"]}
+    cfg = {(x["provider"], x["model"]): x for x in conf["llm"]}
+    cfg_e = {x["provider"]: x for x in conf["embed"]}
+    out = []
+    for k, d in by.items():
+        recent3 = d["last"][-3:]
+        status = "working" if d["last"][-1] else "failing" if len(recent3) >= 2 and not any(recent3) else "degraded"
+        if d["kind"] == "llm" and cool.get((d["provider"], d["model"]), 0) > 0:
+            status = "cooling"
+        out.append({"kind": d["kind"], "provider": d["provider"], "model": d["model"], "calls": d["calls"], "ok": d["ok"], "fail": d["calls"] - d["ok"],
+                    "success": _pct(d["ok"], d["calls"]), "avg_ms": int(sum(d["ms"]) / len(d["ms"])) if d["ms"] else None,
+                    "last_ok": d["last_ok"], "last_fail": d["last_fail"], "last_error": d["last_error"][:160],
+                    "status": status, "cooldown_s": cool.get((d["provider"], d["model"]), 0)})
+    seen = {(x["kind"], x["provider"], x["model"]) for x in out}
+    for x in conf["llm"]:                       # configured but never used (yet)
+        if x["configured"] and ("llm", x["provider"], x["model"]) not in seen:
+            out.append({"kind": "llm", "provider": x["provider"], "model": x["model"], "calls": 0, "ok": 0, "fail": 0, "success": None, "avg_ms": None,
+                        "last_ok": None, "last_fail": None, "last_error": "", "status": "unused", "cooldown_s": x["cooldown_s"]})
+    for x in conf["embed"]:
+        if x["configured"] and ("embed", x["provider"], x["provider"]) not in seen and not any(o["kind"] == "embed" and o["provider"] == x["provider"] for o in out):
+            out.append({"kind": "embed", "provider": x["provider"], "model": x["provider"], "calls": 0, "ok": 0, "fail": 0, "success": None, "avg_ms": None,
+                        "last_ok": None, "last_fail": None, "last_error": "", "status": "unused", "cooldown_s": 0})
+    order = {n: i for i, n in enumerate(conf["llm_order"].split(","))}
+    out.sort(key=lambda x: (x["kind"], order.get(x["provider"], 99), x["model"]))
+    recent.sort(key=lambda r: r["time"], reverse=True)
+    calls = sum(x["calls"] for x in out); okc = sum(x["ok"] for x in out)
+    not_configured = [x["provider"] for x in conf["llm"] if not x["configured"]]
+    return {"start": start, "end": end, "providers": out, "recent_errors": recent[:25],
+            "kpis": {"configured": len({x["provider"] for x in conf["llm"] if x["configured"]}),
+                     "working": sum(1 for x in out if x["status"] == "working"),
+                     "failing": sum(1 for x in out if x["status"] in ("failing", "cooling")),
+                     "calls": calls, "success": _pct(okc, calls)},
+            "llm_order": conf["llm_order"], "embed_order": conf["embed_order"], "not_configured": sorted(set(not_configured))}
