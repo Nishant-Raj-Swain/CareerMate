@@ -237,6 +237,19 @@ def init_analytics_db():
         conn.raw(_VIEW_SQL)
 
 
+def record_quiz(phone: str, topic: str, score: int, attempted: int, completed: bool) -> None:
+    """One row per finished OR abandoned quiz in quiz_analytics (score so far + how many questions were answered).
+    Never raises."""
+    try:
+        with _conn() as conn:
+            conn.raw("INSERT INTO users (phone, resume, state, doc_text) VALUES (%s, '', '{}', '') "
+                     "ON CONFLICT (phone) DO NOTHING", (phone,))
+            conn.raw("INSERT INTO quiz_analytics (user_phone, topic, score, attempted, completed) VALUES (%s,%s,%s,%s,%s)",
+                     (phone, topic, int(score or 0), int(attempted or 0), bool(completed)))
+    except Exception:
+        pass
+
+
 def log_event(phone: str, event_type: str, command: str = None, meta: dict = None,
               success: bool = True, response_time_ms: int = None):
     """Records one analytics event. Never raises — a logging failure should
@@ -1774,7 +1787,7 @@ def _quiz_period(conn, start, end, topic):
                 used.add(best)
                 durations.append(gap)
                 c["minutes"] = gap
-    attempts = max(len(starts), len(completes))
+    attempts = max(len(starts), len(completes) + len(exits))           # a quiz that was left also counts as an attempt
     pcts = [c["pct"] for c in completes if c["pct"] is not None]
     return {
         "starts": starts, "completes": completes, "exits": exits,
@@ -1900,14 +1913,18 @@ def quiz_page(start: str = None, end: str = None, topic: str = None):
     recent = []
     for e in events[:20]:
         pct = e.get("pct")
+        detail = ""
         if e["kind"] == "left":
-            sc, tt = e["meta"].get("score"), e["meta"].get("total")
-            pct = sc * 100 / tt if isinstance(sc, (int, float)) and isinstance(tt, (int, float)) and tt else None
-            status = "In Progress"
+            # the quiz was left before the end: show the score the user had so far (correct answers / questions answered)
+            sc, att, tot = e["meta"].get("score"), e["meta"].get("attempted"), e["meta"].get("total")
+            ok_ = isinstance(sc, (int, float)) and isinstance(att, (int, float))
+            pct = sc * 100 / att if ok_ and att else (0 if ok_ else None)
+            detail = (f"{int(sc)} correct of {int(att)} answered" + (f" ({int(tot)} questions)" if isinstance(tot, (int, float)) and tot else "")) if ok_ else ""
+            status = "Left"
         else:
             status = "Passed" if (pct or 0) >= 60 else "Failed"
         recent.append({"phone": e["phone"], "label": labels.get(e["phone"], "User"), "topic": e["topic"],
-                       "pct": round(pct) if pct is not None else None, "status": status, "time": e["ts"]})
+                       "pct": round(pct) if pct is not None else None, "status": status, "detail": detail, "time": e["ts"]})
 
     return {
         "options": [{"topic": t, "questions": q} for t, q in sorted(opts.items())],
