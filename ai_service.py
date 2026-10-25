@@ -6,7 +6,9 @@ from typing import Any, Dict, List, Union
 
 import httpx
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
+import asyncio
+
+import chat_pdf  # the shared multi-provider fallback chain (Groq -> SambaNova -> NVIDIA ... -> Gemini 2.5 Flash)
 
 load_dotenv()
 
@@ -16,21 +18,19 @@ logger = logging.getLogger("career_bot")
 class AIService:
 
     def __init__(self):
-        # Initialize Gemini model (Updated default to gemini-3.6-flash)
-        model_name = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
-        google_api_key = os.getenv("GEMINI_API_KEY", "").strip()
-
-        if not google_api_key:
-            logger.warning("⚠️ GEMINI_API_KEY is missing in environment variables.")
-
-        self.model = ChatGoogleGenerativeAI(
-            model=model_name,
-            google_api_key=google_api_key,
-            temperature=0.3,
-        )
+        # No single model any more: every request goes through chat_pdf.llm(), which tries each configured
+        # provider / model / key in turn (see CHAT_PDF_LLM_ORDER) and ends with Gemini 2.5 Flash.
+        if not chat_pdf.llm_plan():
+            logger.warning("⚠️ No AI provider key is set (GROQ_API_KEY, GEMINI_API_KEY, ...). AI features will fail.")
         self.adzuna_app_id = os.getenv("ADZUNA_APP_ID", "").strip()
         self.adzuna_app_key = os.getenv("ADZUNA_APP_KEY", "").strip()
-        logger.info(f"✅ AIService initialized using model: {model_name}")
+        logger.info("✅ AIService initialized with the multi-provider fallback chain: %s",
+                    ", ".join(dict.fromkeys(p for p, _, _ in chat_pdf.llm_plan())) or "none")
+
+    async def _ask(self, prompt: str, max_tokens: int = 1500, system: str | None = None) -> str:
+        """One answer from the first working provider (runs the blocking HTTP call in a thread)."""
+        msgs = ([{"role": "system", "content": system}] if system else []) + [{"role": "user", "content": prompt}]
+        return await asyncio.to_thread(chat_pdf.llm, msgs, max_tokens)
 
     def _parse_text(self, content: Union[str, List[Any]]) -> str:
         """Safely extracts raw text content from Gemini responses regardless of whether
@@ -62,7 +62,7 @@ class AIService:
     async def score_resume_ats(
         self, resume_text: str, target_role: str = None
     ) -> str:
-        """Evaluates a resume against Applicant Tracking System criteria using Gemini."""
+        """Evaluates a resume against Applicant Tracking System criteria (any available AI provider)."""
 
         role_instruction = (
             f'Evaluate specifically for the target position: "{target_role}".'
@@ -114,8 +114,7 @@ Resume Text:
 {resume_text}
 """
         try:
-            res = await self.model.ainvoke(prompt)
-            return self._parse_text(res.content)
+            return self._parse_text(await self._ask(prompt, max_tokens=1500))
         except Exception as e:
             logger.error(f"Error performing ATS resume scoring: {e}")
             return "❌ Error generating ATS score. Please try again."
@@ -136,15 +135,15 @@ The JSON must strictly follow this structure:
   "summary": "A brief 2-3 sentence overview explaining how to master {topic}."
 }}
 """
+        raw_text = ""
         try:
-            res = await self.model.ainvoke(prompt)
-            raw_text = self._parse_text(res.content)
+            raw_text = self._parse_text(await self._ask(prompt, max_tokens=1200))
             clean_json = self._clean_json_str(raw_text)
 
             return json.loads(clean_json)
         except json.JSONDecodeError as e:
             logger.error(
-                f"Failed to parse JSON for roadmap '{topic}': {e}\nRaw output was:\n{res.content}"
+                f"Failed to parse JSON for roadmap '{topic}': {e}\nRaw output was:\n{raw_text}"
             )
             return {
                 "sections": {
@@ -251,5 +250,4 @@ Document Context:
 Question:
 {question}
 """
-        res = await self.model.ainvoke(prompt)
-        return self._parse_text(res.content)
+        return self._parse_text(await self._ask(prompt, max_tokens=700))
