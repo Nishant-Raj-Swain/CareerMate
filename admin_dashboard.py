@@ -285,6 +285,17 @@ async def get_learning_books(start: str = None, end: str = None, _: str = Depend
     return learning_analytics.books_page(start, end)
 
 
+@router.get("/api/analytics/learning/ai-providers")
+async def get_ai_providers(start: str = None, end: str = None, _: str = Depends(require_admin)):
+    return learning_analytics.ai_providers_page(start, end)
+
+
+@router.post("/api/analytics/learning/ai-providers/test")
+async def test_ai_providers(_: str = Depends(require_admin)):
+    import asyncio, chat_pdf
+    return {"results": await asyncio.to_thread(chat_pdf.test_providers)}
+
+
 @router.get("/api/analytics/feedback/page")
 async def get_feedback_page(start: str = None, end: str = None, _: str = Depends(require_admin)):
     return feedback.page(start, end)
