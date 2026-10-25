@@ -520,6 +520,7 @@ def notes_from_video_url(video_id: str, meta: dict | None = None, progress=None)
                         return idx, _video_chunk(video_id, k_, m_, idx), None
                     except Exception as e:
                         err = e
+                        chat_pdf.mark_dead_model(m_, e)           # retired model: later slices skip it
                         if "HTTP 400" in str(e):                  # past the end of the video: another model won't help
                             return idx, [], err
                 time.sleep(2.0)
@@ -545,6 +546,8 @@ def notes_from_video_url(video_id: str, meta: dict | None = None, progress=None)
             except Exception:
                 pass
         i += len(batch)
+        if not sections and len(gaps) >= len(batch):      # the whole first batch failed: stop, don't burn calls on 12 slices
+            break
     if not sections:
         raise NotesError("no-video-fallback")
     return _assemble(sections, gaps, meta or {"title": ""})
