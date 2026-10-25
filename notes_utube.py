@@ -507,7 +507,7 @@ def notes_from_video_url(video_id: str, meta: dict | None = None, progress=None)
     key = chat_pdf._gemini_key()
     if not key or _env("NOTES_GEMINI_VIDEO", "1") == "0":
         raise NotesError("no-video-fallback")
-    cands = chat_pdf.gemini_candidates()
+    model = chat_pdf._gemini_model()
     max_chunks = max(1, math.ceil(MAX_MINUTES * 60 / VIDEO_CHUNK_SECONDS))
     sections, gaps, i, ended = [], [], 0, False
     while i < max_chunks and not ended:
@@ -515,14 +515,11 @@ def notes_from_video_url(video_id: str, meta: dict | None = None, progress=None)
 
         def one(idx):
             for attempt in range(2):
-                for m_, k_ in cands[:4]:                          # Gemini 2.5 Flash first, then the other models / keys
-                    try:
-                        return idx, _video_chunk(video_id, k_, m_, idx), None
-                    except Exception as e:
-                        err = e
-                        if "HTTP 400" in str(e):                  # past the end of the video: another model won't help
-                            return idx, [], err
-                time.sleep(2.0)
+                try:
+                    return idx, _video_chunk(video_id, key, model, idx), None
+                except Exception as e:
+                    err = e
+                    time.sleep(2.0)
             return idx, [], err
         with ThreadPoolExecutor(max_workers=WORKERS) as ex:
             results = list(ex.map(one, batch))
