@@ -45,14 +45,20 @@ def extract_text(filename: str, content: bytes) -> str:
     if not text.strip():
         try:
             mime_type = "application/pdf" if filename.endswith(".pdf") else "image/png"
-            response = client.models.generate_content(
-                model="gemini-3.6-flash",
-                contents=[
-                    types.Part.from_bytes(data=content, mime_type=mime_type),
-                    "Extract and return all readable text from this document verbatim. Do not summarize or format into markdown."
-                ]
-            )
-            text = response.text or ""
+            for model in ("gemini-2.5-flash", "gemini-2.5-flash-lite"):         # second model is the fallback
+                try:
+                    response = client.models.generate_content(
+                        model=model,
+                        contents=[
+                            types.Part.from_bytes(data=content, mime_type=mime_type),
+                            "Extract and return all readable text from this document verbatim. Do not summarize or format into markdown."
+                        ]
+                    )
+                    text = response.text or ""
+                    if text.strip():
+                        break
+                except Exception as e:
+                    print(f"Gemini OCR Error ({model}): {e}")
         except Exception as e:
             print(f"Gemini OCR Error: {e}")
 
